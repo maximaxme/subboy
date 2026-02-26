@@ -1,0 +1,23 @@
+# Секреты — не коммитить
+.env
+CREDENTIALS.md
+
+# Node
+node_modules/
+
+# Python
+venv/
+__pycache__/
+*.pyc
+*.pyo
+
+# Build / dist
+dist/
+build/
+
+# IDE / OS
+.idea/
+.vscode/
+*.swp
+*.swo
+.DS_Store

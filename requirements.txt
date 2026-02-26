@@ -1,0 +1,9 @@
+aiogram>=3.0.0
+sqlalchemy[asyncio]>=2.0.0
+asyncpg
+pydantic-settings
+python-dotenv
+alembic
+fastapi>=0.100.0
+uvicorn[standard]>=0.22.0
+pyjwt>=2.8.0

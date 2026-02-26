@@ -1,0 +1,13 @@
+@import "tailwindcss";
+@import "./styles/theme.css";
+
+body {
+  margin: 0;
+  font-family: var(--font-sans);
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+#root {
+  min-height: 100vh;
+}
