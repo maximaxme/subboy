@@ -1,5 +1,6 @@
 # Секреты — не коммитить
 .env
+.env.*
 CREDENTIALS.md
 
 # Node
