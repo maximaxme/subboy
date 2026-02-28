@@ -65,17 +65,28 @@ async def main() -> None:
         default=DefaultBotProperties(parse_mode=ParseMode.HTML),
     )
 
-    scheduler = create_scheduler(bot)
+    # Scheduler for notifications
+    scheduler = create_scheduler(
+        bot=bot,
+        session_factory=db_helper.session_factory,
+    )
     scheduler.start()
-    logger.info("Scheduler started")
+    logger.info("Scheduler started.")
 
     try:
+        logger.info("Starting bot...")
         await dp.start_polling(bot)
     finally:
         scheduler.shutdown(wait=False)
-        logger.info("Scheduler stopped")
-        await db_helper.dispose()
+        await bot.session.close()
+        logger.info("Bot shut down cleanly.")
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        logger.info("Bot stopped by user")
+    except Exception as e:
+        logger.exception("Bot crashed: %s", e)
+        sys.exit(1)

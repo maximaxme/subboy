@@ -1,24 +1,25 @@
 from aiogram.fsm.state import State, StatesGroup
 
 
-class AddSubStates(StatesGroup):
-    waiting_name          = State()
-    waiting_amount        = State()
-    waiting_currency      = State()
-    waiting_billing_cycle = State()
-    waiting_next_date     = State()
-    waiting_category      = State()
+class AddSubscription(StatesGroup):
+    """States for adding a new subscription step by step."""
+    name = State()
+    price = State()
+    period = State()
+    category = State()
+    next_payment = State()
 
 
-class EditSubStates(StatesGroup):
-    choosing_field    = State()
-    waiting_new_value = State()
+class EditSubscription(StatesGroup):
+    """States for editing an existing subscription field by field."""
+    # Which subscription is being edited is stored in FSM data as 'sub_id'
+    name = State()
+    price = State()
+    period = State()
+    next_payment = State()
+    category = State()
 
 
-class CategoryStates(StatesGroup):
-    waiting_name   = State()
-    waiting_rename = State()
-
-
-class SettingsStates(StatesGroup):
-    waiting_hour = State()
+class ManageCategories(StatesGroup):
+    """States for creating / renaming categories."""
+    name = State()

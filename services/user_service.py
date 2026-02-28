@@ -1,36 +1,51 @@
 """
-services/user_service.py — User registration and retrieval.
+services/user_service.py — User registration and lookup helpers.
 """
 from __future__ import annotations
 
-from typing import Optional
-
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from database.models import User
+from database.models import NotificationSettings, User
 
 
 async def get_or_create_user(
     session: AsyncSession,
     telegram_id: int,
-    username: Optional[str],
-    first_name: Optional[str],
+    username: str | None,
+    full_name: str | None,
 ) -> User:
     """
-    Retrieve an existing user or create a new one.
-    Sets `user.is_new = True` if the user was just created.
+    Return the existing User record or create a new one.
+    Also creates default NotificationSettings (day_before=True) for new users.
     """
     user = await session.get(User, telegram_id)
     if user is None:
         user = User(
-            telegram_id=telegram_id,
+            id=telegram_id,
             username=username,
-            first_name=first_name,
+            full_name=full_name,
         )
         session.add(user)
+
+        # Default notification settings for new users
+        ns = NotificationSettings(
+            user_id=telegram_id,
+            day_before=True,
+            weekly=False,
+            monthly=False,
+        )
+        session.add(ns)
         await session.commit()
-        await session.refresh(user)
-        user.is_new = True  # transient flag
     else:
-        user.is_new = False
+        # Keep username/full_name up to date
+        changed = False
+        if user.username != username:
+            user.username = username
+            changed = True
+        if user.full_name != full_name:
+            user.full_name = full_name
+            changed = True
+        if changed:
+            await session.commit()
+
     return user
