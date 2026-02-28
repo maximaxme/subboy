@@ -1,47 +1,51 @@
-from aiogram import Router, types, F
-from aiogram.filters import CommandStart
-from aiogram.utils.keyboard import InlineKeyboardBuilder
-from sqlalchemy.ext.asyncio import AsyncSession
-from services.user_service import get_or_create_user
+"""
+handlers/start.py — /start command, /help command, main menu.
+"""
+from __future__ import annotations
 
-router = Router()
+from aiogram import Router
+from aiogram.filters import CommandStart, Command
+from aiogram.fsm.context import FSMContext
+from aiogram.types import Message
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from database.models import User
+from services.user_service import get_or_create_user
+from .menu import send_main_menu
+
+router = Router(name="start")
+
 
 @router.message(CommandStart())
-async def cmd_start(message: types.Message, session: AsyncSession):
-    await get_or_create_user(
+async def cmd_start(message: Message, session: AsyncSession, state: FSMContext) -> None:
+    """Handle /start: register user if new, show main menu."""
+    await state.clear()
+    user: User = await get_or_create_user(
         session=session,
-        user_id=message.from_user.id,
+        telegram_id=message.from_user.id,
         username=message.from_user.username,
-        full_name=message.from_user.full_name
+        first_name=message.from_user.first_name,
     )
-    
-    kb = InlineKeyboardBuilder()
-    kb.row(types.InlineKeyboardButton(text="➕ Добавить подписку", callback_data="add_sub"))
-    kb.row(types.InlineKeyboardButton(text="📋 Мои подписки", callback_data="my_subs"))
-    kb.row(types.InlineKeyboardButton(text="🗂 Категории", callback_data="categories"))
-    kb.row(types.InlineKeyboardButton(text="📊 Отчёты", callback_data="reports"))
-    kb.row(types.InlineKeyboardButton(text="⚙️ Настройки", callback_data="settings"))
-
-    await message.answer(
-        "👋 Привет!\n"
-        "Я помогу следить за подписками и не забывать про списания.\n\n"
-        "Начнём?",
-        reply_markup=kb.as_markup()
+    greeting = (
+        f"👋 Welcome back, {message.from_user.first_name}!"
+        if not user.is_new
+        else f"👋 Hello, {message.from_user.first_name}! I'm Subboy — your subscription tracker."
     )
+    await message.answer(greeting)
+    await send_main_menu(message)
 
-@router.callback_query(F.data == "back_to_main")
-async def back_to_main(callback: types.CallbackQuery, session: AsyncSession):
-    kb = InlineKeyboardBuilder()
-    kb.row(types.InlineKeyboardButton(text="➕ Добавить подписку", callback_data="add_sub"))
-    kb.row(types.InlineKeyboardButton(text="📋 Мои подписки", callback_data="my_subs"))
-    kb.row(types.InlineKeyboardButton(text="🗂 Категории", callback_data="categories"))
-    kb.row(types.InlineKeyboardButton(text="📊 Отчёты", callback_data="reports"))
-    kb.row(types.InlineKeyboardButton(text="⚙️ Настройки", callback_data="settings"))
 
-    await callback.message.edit_text(
-        "👋 Привет!\n"
-        "Я помогу следить за подписками и не забывать про списания.\n\n"
-        "Начнём?",
-        reply_markup=kb.as_markup()
+@router.message(Command("help"))
+async def cmd_help(message: Message, state: FSMContext) -> None:
+    """Show help text."""
+    await state.clear()
+    help_text = (
+        "<b>Subboy — Subscription Tracker</b>\n\n"
+        "Commands:\n"
+        "/start — Main menu\n"
+        "/help  — This message\n\n"
+        "Use the buttons below to manage your subscriptions, "
+        "view reports, and configure notifications."
     )
-    await callback.answer()
+    await message.answer(help_text)
+    await send_main_menu(message)
