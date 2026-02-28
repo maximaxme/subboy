@@ -1,478 +1,779 @@
 """
-handlers/subscriptions.py — Complete rewrite.
+handlers/subscriptions.py — Subscription management.
 
 Features:
-- List subscriptions (paginated, per-category filter)
-- Add subscription (multi-step FSM)
-- Edit subscription (multi-step FSM, inline button)
-- Delete subscription (confirm dialog, inline button)
-- Toggle active/paused (inline button)
+- Beautiful sorted subscription list with monthly total and nearest payment
+- Clickable inline buttons per subscription → detail view
+- "Edit" button opens submenu with field selection
+- Pause/resume subscription toggle
+- Edit each field via FSM (name, price, period, next_payment, category)
+- Delete with confirmation
+- Add subscription via FSM
 """
 from __future__ import annotations
 
-import logging
+import re
+from datetime import date, datetime
 from decimal import Decimal, InvalidOperation
-from typing import Optional
 
-from aiogram import Router, F
-from aiogram.filters import Command
+from aiogram import F, Router
+from aiogram.filters import StateFilter
 from aiogram.fsm.context import FSMContext
 from aiogram.types import (
-    Message,
     CallbackQuery,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
+    Message,
 )
+from dateutil.relativedelta import relativedelta
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from database.models import Subscription, Category
-from utils.states import AddSubStates, EditSubStates
+from database.models import Category, Subscription
+from utils.states import AddSubscription, EditSubscription
 
-logger = logging.getLogger(__name__)
-router = Router(name="subscriptions")
+router = Router()
 
-# ─── Constants ────────────────────────────────────────────────────────────────
+# ──────────────────────────────────────────────────────────────────────────────
+# Locale helpers
+# ──────────────────────────────────────────────────────────────────────────────
 
-PAGE_SIZE = 5
-
-BILLING_CYCLES = [
-    ("Monthly", "monthly"),
-    ("Yearly", "yearly"),
-    ("Weekly", "weekly"),
-    ("Daily", "daily"),
+RU_MONTHS_GEN = [
+    "", "янв", "фев", "мар", "апр", "май", "июн",
+    "июл", "авг", "сен", "окт", "ноя", "дек",
 ]
 
-# ─── Helpers ──────────────────────────────────────────────────────────────────
+PERIOD_LABELS = {
+    "monthly": "Ежемесячно",
+    "yearly": "Ежегодно",
+}
 
 
-def _sub_card(sub: Subscription) -> str:
-    """Render a single subscription as an HTML card."""
-    status = "✅ Active" if sub.is_active else "⏸ Paused"
-    return (
-        f"<b>{sub.name}</b>\n"
-        f"  💰 {sub.amount:.2f} {sub.currency} / {sub.billing_cycle}\n"
-        f"  📅 Next: {sub.next_billing_date}\n"
-        f"  🏷 Category: {sub.category.name if sub.category else '—'}\n"
-        f"  {status}\n"
+def fmt_price(price: Decimal) -> str:
+    """Format price with space-thousands separator: 1 505.00"""
+    integer_part = int(price)
+    frac = int(round((price - integer_part) * 100))
+    s = f"{integer_part:,}".replace(",", "\u00a0")  # non-breaking space
+    return f"{s}.{frac:02d}"
+
+
+def relative_days(target: date) -> str:
+    """Return human-readable relative date string."""
+    today = date.today()
+    delta = (target - today).days
+    if delta < 0:
+        return "просрочено"
+    if delta == 0:
+        return "сегодня"
+    if delta == 1:
+        return "завтра"
+    # Pluralize Russian "дней/день/дня"
+    if 11 <= delta % 100 <= 19:
+        word = "дней"
+    elif delta % 10 == 1:
+        word = "день"
+    elif 2 <= delta % 10 <= 4:
+        word = "дня"
+    else:
+        word = "дней"
+    return f"через {delta} {word}"
+
+
+def short_date(d: date) -> str:
+    """Return short date like '24 мар'."""
+    return f"{d.day} {RU_MONTHS_GEN[d.month]}"
+
+
+def full_date(d: date) -> str:
+    """Return full date like '24.03.2026'."""
+    return d.strftime("%d.%m.%Y")
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Keyboards
+# ──────────────────────────────────────────────────────────────────────────────
+
+def subs_list_keyboard(subs: list[Subscription]) -> InlineKeyboardMarkup:
+    """One button per subscription + back."""
+    buttons = []
+    for sub in subs:
+        label = sub.name
+        if not sub.is_active:
+            label = f"⏸ {sub.name}"
+        buttons.append(
+            [InlineKeyboardButton(text=label, callback_data=f"sub_detail:{sub.id}")]
+        )
+    buttons.append(
+        [InlineKeyboardButton(text="⬅️ Назад", callback_data="back_to_main")]
     )
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
 
 
-def _sub_list_keyboard(
-    subscriptions: list[Subscription],
-    page: int,
-    total_pages: int,
-    category_id: Optional[int] = None,
-) -> InlineKeyboardMarkup:
-    """Build paginated inline keyboard for subscription list."""
-    rows: list[list[InlineKeyboardButton]] = []
+def sub_detail_keyboard(sub: Subscription) -> InlineKeyboardMarkup:
+    """Detail view: Edit, Pause/Resume, Delete, Back."""
+    if sub.is_active:
+        pause_btn = InlineKeyboardButton(
+            text="⏸ Приостановить", callback_data=f"toggle_active:{sub.id}"
+        )
+    else:
+        pause_btn = InlineKeyboardButton(
+            text="▶️ Возобновить", callback_data=f"toggle_active:{sub.id}"
+        )
 
-    for sub in subscriptions:
-        toggle_label = "⏸ Pause" if sub.is_active else "▶️ Resume"
-        rows.append([
-            InlineKeyboardButton(
-                text=f"{sub.name} — {sub.amount:.2f} {sub.currency}",
-                callback_data=f"sub:view:{sub.id}",
-            )
-        ])
-        rows.append([
-            InlineKeyboardButton(text="✏️ Edit",   callback_data=f"sub:edit:{sub.id}"),
-            InlineKeyboardButton(text=toggle_label, callback_data=f"sub:toggle:{sub.id}"),
-            InlineKeyboardButton(text="🗑 Delete",  callback_data=f"sub:delete:{sub.id}"),
-        ])
-
-    # Pagination row
-    nav: list[InlineKeyboardButton] = []
-    if page > 0:
-        cat_part = f":{category_id}" if category_id else ":0"
-        nav.append(InlineKeyboardButton(text="◀️", callback_data=f"sub:page:{page - 1}{cat_part}"))
-    nav.append(InlineKeyboardButton(text=f"{page + 1}/{total_pages}", callback_data="noop"))
-    if page + 1 < total_pages:
-        cat_part = f":{category_id}" if category_id else ":0"
-        nav.append(InlineKeyboardButton(text="▶️", callback_data=f"sub:page:{page + 1}{cat_part}"))
-    if nav:
-        rows.append(nav)
-
-    rows.append([InlineKeyboardButton(text="➕ Add Subscription", callback_data="sub:add")])
-    return InlineKeyboardMarkup(inline_keyboard=rows)
-
-
-def _billing_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[
-            [InlineKeyboardButton(text=label, callback_data=f"billing:{value}")]
-            for label, value in BILLING_CYCLES
+            [InlineKeyboardButton(text="✏️ Редактировать", callback_data=f"edit_sub_menu:{sub.id}")],
+            [pause_btn],
+            [InlineKeyboardButton(text="🗑 Удалить", callback_data=f"delete_sub_ask:{sub.id}")],
+            [InlineKeyboardButton(text="⬅️ Назад", callback_data="my_subs")],
         ]
     )
 
 
-async def _get_category_keyboard(session: AsyncSession, user_id: int) -> InlineKeyboardMarkup:
+def edit_menu_keyboard(sub_id: int) -> InlineKeyboardMarkup:
+    """Edit submenu — choose which field to edit."""
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(text="📝 Название", callback_data=f"edit_sub_name:{sub_id}"),
+                InlineKeyboardButton(text="💰 Цена", callback_data=f"edit_sub_price:{sub_id}"),
+            ],
+            [
+                InlineKeyboardButton(text="🔁 Период", callback_data=f"edit_sub_period:{sub_id}"),
+                InlineKeyboardButton(text="📅 Дата", callback_data=f"edit_sub_date:{sub_id}"),
+            ],
+            [InlineKeyboardButton(text="🗂 Категория", callback_data=f"edit_sub_cat:{sub_id}")],
+            [InlineKeyboardButton(text="⬅️ Назад", callback_data=f"sub_detail:{sub_id}")],
+        ]
+    )
+
+
+def period_keyboard(sub_id: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(text="📅 Ежемесячно", callback_data=f"set_period:monthly:{sub_id}"),
+                InlineKeyboardButton(text="📆 Ежегодно", callback_data=f"set_period:yearly:{sub_id}"),
+            ],
+            [InlineKeyboardButton(text="⬅️ Отмена", callback_data=f"sub_detail:{sub_id}")],
+        ]
+    )
+
+
+def add_period_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(text="📅 Ежемесячно", callback_data="set_add_period:monthly"),
+                InlineKeyboardButton(text="📆 Ежегодно", callback_data="set_add_period:yearly"),
+            ],
+            [InlineKeyboardButton(text="⬅️ Отмена", callback_data="back_to_main")],
+        ]
+    )
+
+
+def delete_confirm_keyboard(sub_id: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(text="✅ Да, удалить", callback_data=f"delete_sub_confirm:{sub_id}"),
+                InlineKeyboardButton(text="❌ Отмена", callback_data=f"sub_detail:{sub_id}"),
+            ]
+        ]
+    )
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Subscription list helpers
+# ──────────────────────────────────────────────────────────────────────────────
+
+async def _get_user_subs(session: AsyncSession, user_id: int) -> list[Subscription]:
     result = await session.execute(
-        select(Category).where(Category.user_id == user_id).order_by(Category.name)
+        select(Subscription)
+        .where(Subscription.user_id == user_id)
+        .order_by(Subscription.is_active.desc(), Subscription.next_payment)
     )
-    categories = result.scalars().all()
-    rows = [
-        [InlineKeyboardButton(text=cat.name, callback_data=f"cat_pick:{cat.id}")]
-        for cat in categories
-    ]
-    rows.append([InlineKeyboardButton(text="— No category —", callback_data="cat_pick:0")])
-    return InlineKeyboardMarkup(inline_keyboard=rows)
+    return list(result.scalars().all())
 
 
-async def _fetch_page(
-    session: AsyncSession,
-    user_id: int,
-    page: int,
-    category_id: Optional[int] = None,
-) -> tuple[list[Subscription], int]:
-    """Return (subscriptions_on_page, total_pages)."""
-    q = select(Subscription).where(Subscription.user_id == user_id)
-    if category_id:
-        q = q.where(Subscription.category_id == category_id)
-    q = q.order_by(Subscription.next_billing_date)
-
-    result = await session.execute(q)
-    all_subs = result.scalars().all()
-    total_pages = max(1, (len(all_subs) + PAGE_SIZE - 1) // PAGE_SIZE)
-    start = page * PAGE_SIZE
-    return list(all_subs[start: start + PAGE_SIZE]), total_pages
+async def _get_user_categories(session: AsyncSession, user_id: int) -> dict[int, str]:
+    result = await session.execute(
+        select(Category).where(Category.user_id == user_id)
+    )
+    return {c.id: c.name for c in result.scalars().all()}
 
 
-# ─── List / Entry ──────────────────────────────────────────────────────────────
-
-
-@router.message(Command("subscriptions"))
-@router.message(F.text == "📋 My Subscriptions")
-async def cmd_subscriptions(message: Message, session: AsyncSession, state: FSMContext) -> None:
-    await state.clear()
-    user_id = message.from_user.id
-    subs, total_pages = await _fetch_page(session, user_id, 0)
+def _build_list_text(subs: list[Subscription]) -> str:
     if not subs:
-        await message.answer(
-            "You have no subscriptions yet.\n\nTap <b>➕ Add Subscription</b> to get started.",
-            reply_markup=InlineKeyboardMarkup(
-                inline_keyboard=[
-                    [InlineKeyboardButton(text="➕ Add Subscription", callback_data="sub:add")]
-                ]
-            ),
+        return (
+            "📋 У тебя пока нет подписок.\n\n"
+            "Нажми <b>➕ Добавить подписку</b>, чтобы добавить первую."
         )
-        return
-    text = "<b>Your Subscriptions</b>\n\n" + "\n".join(_sub_card(s) for s in subs)
-    await message.answer(
-        text,
-        reply_markup=_sub_list_keyboard(subs, 0, total_pages),
+
+    active_subs = [s for s in subs if s.is_active]
+    paused_subs = [s for s in subs if not s.is_active]
+
+    lines = ["📋 <b>Твои подписки:</b>\n"]
+    monthly_total = Decimal("0")
+
+    for sub in active_subs:
+        period_sym = "мес" if sub.period == "monthly" else "год"
+        price_str = fmt_price(sub.price)
+        rel = relative_days(sub.next_payment)
+        short = short_date(sub.next_payment)
+        lines.append(
+            f"🔹 <b>{sub.name}</b> — {price_str} ₽/{period_sym}\n"
+            f"   📅 {short} ({rel})"
+        )
+        if sub.period == "monthly":
+            monthly_total += sub.price
+        else:
+            monthly_total += sub.price / 12
+
+    if paused_subs:
+        lines.append("\n⏸ <b>Приостановлены:</b>")
+        for sub in paused_subs:
+            period_sym = "мес" if sub.period == "monthly" else "год"
+            price_str = fmt_price(sub.price)
+            lines.append(f"   ⏸ <s>{sub.name}</s> — {price_str} ₽/{period_sym}")
+
+    lines.append("\n━━━━━━━━━━━━━━━")
+    lines.append(f"💰 Итого в месяц: ~{fmt_price(monthly_total.quantize(Decimal('0.01')))} ₽")
+
+    if active_subs:
+        nearest = active_subs[0]
+        rel_nearest = relative_days(nearest.next_payment)
+        lines.append(f"📅 Ближайшее: <b>{nearest.name}</b> {rel_nearest}")
+
+    return "\n".join(lines)
+
+
+def _build_detail_text(sub: Subscription, cat_name: str | None) -> str:
+    price_str = fmt_price(sub.price)
+    period_label = PERIOD_LABELS.get(sub.period, sub.period)
+    cat_display = cat_name if cat_name else "—"
+    added = full_date(sub.created_at.date()) if hasattr(sub.created_at, "date") else full_date(sub.created_at)
+
+    status = "🟢 Активна" if sub.is_active else "⏸ Приостановлена"
+
+    return (
+        f"{'✏️' if sub.is_active else '⏸'} <b>{sub.name}</b>\n\n"
+        f"📊 Статус: {status}\n"
+        f"💰 Цена: {price_str} ₽\n"
+        f"🔁 Период: {period_label}\n"
+        f"📅 Следующее списание: {full_date(sub.next_payment)}\n"
+        f"🗂 Категория: {cat_display}\n"
+        f"📆 Добавлена: {added}"
     )
 
 
-@router.callback_query(F.data.startswith("sub:page:"))
-async def cb_page(callback: CallbackQuery, session: AsyncSession) -> None:
-    _, _, rest = callback.data.split(":", 2)
-    parts = rest.split(":")
-    page = int(parts[0])
-    category_id = int(parts[1]) if len(parts) > 1 and parts[1] != "0" else None
-    user_id = callback.from_user.id
+# ──────────────────────────────────────────────────────────────────────────────
+# "My subscriptions" list
+# ──────────────────────────────────────────────────────────────────────────────
 
-    subs, total_pages = await _fetch_page(session, user_id, page, category_id)
-    text = "<b>Your Subscriptions</b>\n\n" + "\n".join(_sub_card(s) for s in subs)
+@router.callback_query(F.data == "my_subs")
+async def show_subscriptions(callback: CallbackQuery, session: AsyncSession, state: FSMContext) -> None:
+    await state.clear()
+    subs = await _get_user_subs(session, callback.from_user.id)
+    text = _build_list_text(subs)
+    markup = subs_list_keyboard(subs)
+    await callback.message.edit_text(text, reply_markup=markup, parse_mode="HTML")
+    await callback.answer()
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Subscription detail
+# ──────────────────────────────────────────────────────────────────────────────
+
+@router.callback_query(F.data.startswith("sub_detail:"))
+async def show_sub_detail(callback: CallbackQuery, session: AsyncSession, state: FSMContext) -> None:
+    await state.clear()
+    sub_id = int(callback.data.split(":")[1])
+    sub = await session.get(Subscription, sub_id)
+    if not sub or sub.user_id != callback.from_user.id:
+        await callback.answer("Подписка не найдена.", show_alert=True)
+        return
+
+    cats = await _get_user_categories(session, callback.from_user.id)
+    cat_name = cats.get(sub.category_id) if sub.category_id else None
+    text = _build_detail_text(sub, cat_name)
     await callback.message.edit_text(
         text,
-        reply_markup=_sub_list_keyboard(subs, page, total_pages, category_id),
+        reply_markup=sub_detail_keyboard(sub),
+        parse_mode="HTML",
     )
     await callback.answer()
 
 
-# ─── View (detail) ─────────────────────────────────────────────────────────────
+# ──────────────────────────────────────────────────────────────────────────────
+# Toggle active/paused
+# ──────────────────────────────────────────────────────────────────────────────
 
-
-@router.callback_query(F.data.startswith("sub:view:"))
-async def cb_view(callback: CallbackQuery, session: AsyncSession) -> None:
-    sub_id = int(callback.data.split(":")[2])
+@router.callback_query(F.data.startswith("toggle_active:"))
+async def toggle_active(callback: CallbackQuery, session: AsyncSession) -> None:
+    sub_id = int(callback.data.split(":")[1])
     sub = await session.get(Subscription, sub_id)
     if not sub or sub.user_id != callback.from_user.id:
-        await callback.answer("Not found.", show_alert=True)
+        await callback.answer("Подписка не найдена.", show_alert=True)
         return
-    await callback.answer(_sub_card(sub), show_alert=True)
 
-
-# ─── Toggle active ─────────────────────────────────────────────────────────────
-
-
-@router.callback_query(F.data.startswith("sub:toggle:"))
-async def cb_toggle(callback: CallbackQuery, session: AsyncSession) -> None:
-    sub_id = int(callback.data.split(":")[2])
-    sub = await session.get(Subscription, sub_id)
-    if not sub or sub.user_id != callback.from_user.id:
-        await callback.answer("Not found.", show_alert=True)
-        return
     sub.is_active = not sub.is_active
     await session.commit()
-    status = "resumed ▶️" if sub.is_active else "paused ⏸"
-    await callback.answer(f"{sub.name} {status}")
-    # Refresh list
-    subs, total_pages = await _fetch_page(session, callback.from_user.id, 0)
-    text = "<b>Your Subscriptions</b>\n\n" + "\n".join(_sub_card(s) for s in subs)
+
+    status_text = "возобновлена ▶️" if sub.is_active else "приостановлена ⏸"
+    await callback.answer(f"Подписка {status_text}")
+
+    cats = await _get_user_categories(session, callback.from_user.id)
+    cat_name = cats.get(sub.category_id) if sub.category_id else None
     await callback.message.edit_text(
-        text,
-        reply_markup=_sub_list_keyboard(subs, 0, total_pages),
+        _build_detail_text(sub, cat_name),
+        reply_markup=sub_detail_keyboard(sub),
+        parse_mode="HTML",
     )
 
 
-# ─── Delete ────────────────────────────────────────────────────────────────────
+# ──────────────────────────────────────────────────────────────────────────────
+# Edit menu (submenu)
+# ──────────────────────────────────────────────────────────────────────────────
 
-
-@router.callback_query(F.data.startswith("sub:delete:"))
-async def cb_delete_confirm(callback: CallbackQuery, session: AsyncSession) -> None:
-    sub_id = int(callback.data.split(":")[2])
+@router.callback_query(F.data.startswith("edit_sub_menu:"))
+async def show_edit_menu(callback: CallbackQuery, session: AsyncSession) -> None:
+    sub_id = int(callback.data.split(":")[1])
     sub = await session.get(Subscription, sub_id)
     if not sub or sub.user_id != callback.from_user.id:
-        await callback.answer("Not found.", show_alert=True)
+        await callback.answer("Подписка не найдена.", show_alert=True)
         return
-    await callback.message.answer(
-        f"Are you sure you want to delete <b>{sub.name}</b>?",
+
+    await callback.message.edit_text(
+        f"✏️ Редактирование <b>{sub.name}</b>\n\nЧто изменить?",
+        reply_markup=edit_menu_keyboard(sub_id),
+        parse_mode="HTML",
+    )
+    await callback.answer()
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Edit: NAME
+# ──────────────────────────────────────────────────────────────────────────────
+
+@router.callback_query(F.data.startswith("edit_sub_name:"))
+async def edit_name_ask(callback: CallbackQuery, state: FSMContext) -> None:
+    sub_id = int(callback.data.split(":")[1])
+    await state.update_data(sub_id=sub_id)
+    await state.set_state(EditSubscription.name)
+    await callback.message.edit_text(
+        "✏️ Введи новое название подписки:",
         reply_markup=InlineKeyboardMarkup(
-            inline_keyboard=[
-                [
-                    InlineKeyboardButton(text="✅ Yes, delete", callback_data=f"sub:del_confirm:{sub_id}"),
-                    InlineKeyboardButton(text="❌ Cancel",      callback_data="sub:del_cancel"),
-                ]
-            ]
+            inline_keyboard=[[InlineKeyboardButton(text="⬅️ Отмена", callback_data=f"sub_detail:{sub_id}")]]
         ),
+        parse_mode="HTML",
     )
     await callback.answer()
 
 
-@router.callback_query(F.data.startswith("sub:del_confirm:"))
-async def cb_delete_execute(callback: CallbackQuery, session: AsyncSession) -> None:
-    sub_id = int(callback.data.split(":")[2])
-    sub = await session.get(Subscription, sub_id)
-    if sub and sub.user_id == callback.from_user.id:
-        await session.delete(sub)
-        await session.commit()
-        await callback.message.edit_text(f"🗑 <b>{sub.name}</b> deleted.")
-    else:
-        await callback.answer("Not found.", show_alert=True)
-    await callback.answer()
-
-
-@router.callback_query(F.data == "sub:del_cancel")
-async def cb_delete_cancel(callback: CallbackQuery) -> None:
-    await callback.message.edit_text("Deletion cancelled.")
-    await callback.answer()
-
-
-# ─── Add subscription FSM ──────────────────────────────────────────────────────
-
-
-@router.callback_query(F.data == "sub:add")
-async def cb_add_start(callback: CallbackQuery, state: FSMContext) -> None:
-    await state.set_state(AddSubStates.waiting_name)
-    await callback.message.answer("Enter subscription name (e.g. <i>Netflix</i>):")
-    await callback.answer()
-
-
-@router.message(AddSubStates.waiting_name)
-async def add_sub_name(message: Message, state: FSMContext) -> None:
-    await state.update_data(name=message.text.strip())
-    await state.set_state(AddSubStates.waiting_amount)
-    await message.answer("Enter the amount (e.g. <i>9.99</i>):")
-
-
-@router.message(AddSubStates.waiting_amount)
-async def add_sub_amount(message: Message, state: FSMContext) -> None:
-    try:
-        amount = Decimal(message.text.strip().replace(",", "."))
-    except InvalidOperation:
-        await message.answer("⚠️ Invalid amount. Please enter a number like <i>9.99</i>:")
+@router.message(StateFilter(EditSubscription.name))
+async def edit_name_save(message: Message, state: FSMContext, session: AsyncSession) -> None:
+    data = await state.get_data()
+    sub_id = data["sub_id"]
+    new_name = message.text.strip()
+    if not new_name:
+        await message.answer("Название не может быть пустым. Попробуй ещё раз:")
         return
-    await state.update_data(amount=str(amount))
-    await state.set_state(AddSubStates.waiting_currency)
-    await message.answer("Enter currency (e.g. <i>USD</i>, <i>EUR</i>, <i>RUB</i>):")
+
+    sub = await session.get(Subscription, sub_id)
+    if not sub or sub.user_id != message.from_user.id:
+        await state.clear()
+        await message.answer("Подписка не найдена.")
+        return
+
+    sub.name = new_name
+    await session.commit()
+    await state.clear()
+
+    cats = await _get_user_categories(session, message.from_user.id)
+    cat_name = cats.get(sub.category_id) if sub.category_id else None
+    await message.answer(
+        _build_detail_text(sub, cat_name),
+        reply_markup=sub_detail_keyboard(sub),
+        parse_mode="HTML",
+    )
 
 
-@router.message(AddSubStates.waiting_currency)
-async def add_sub_currency(message: Message, state: FSMContext) -> None:
-    await state.update_data(currency=message.text.strip().upper())
-    await state.set_state(AddSubStates.waiting_billing_cycle)
-    await message.answer("Choose billing cycle:", reply_markup=_billing_keyboard())
+# ──────────────────────────────────────────────────────────────────────────────
+# Edit: PRICE
+# ──────────────────────────────────────────────────────────────────────────────
 
-
-@router.callback_query(F.data.startswith("billing:"), AddSubStates.waiting_billing_cycle)
-async def add_sub_billing(callback: CallbackQuery, state: FSMContext) -> None:
-    cycle = callback.data.split(":")[1]
-    await state.update_data(billing_cycle=cycle)
-    await state.set_state(AddSubStates.waiting_next_date)
-    await callback.message.answer(
-        "Enter next billing date (YYYY-MM-DD), or type <i>today</i>:"
+@router.callback_query(F.data.startswith("edit_sub_price:"))
+async def edit_price_ask(callback: CallbackQuery, state: FSMContext) -> None:
+    sub_id = int(callback.data.split(":")[1])
+    await state.update_data(sub_id=sub_id)
+    await state.set_state(EditSubscription.price)
+    await callback.message.edit_text(
+        "💰 Введи новую цену (например: <code>199</code> или <code>1505.50</code>):",
+        reply_markup=InlineKeyboardMarkup(
+            inline_keyboard=[[InlineKeyboardButton(text="⬅️ Отмена", callback_data=f"sub_detail:{sub_id}")]]
+        ),
+        parse_mode="HTML",
     )
     await callback.answer()
 
 
-@router.message(AddSubStates.waiting_next_date)
-async def add_sub_date(message: Message, state: FSMContext, session: AsyncSession) -> None:
-    from datetime import date, timedelta
-    text = message.text.strip().lower()
-    if text == "today":
-        next_date = date.today()
-    else:
-        try:
-            next_date = date.fromisoformat(text)
-        except ValueError:
-            await message.answer("⚠️ Invalid date. Use YYYY-MM-DD or type <i>today</i>:")
-            return
-    await state.update_data(next_billing_date=str(next_date))
-    await state.set_state(AddSubStates.waiting_category)
+@router.message(StateFilter(EditSubscription.price))
+async def edit_price_save(message: Message, state: FSMContext, session: AsyncSession) -> None:
+    data = await state.get_data()
+    sub_id = data["sub_id"]
+
+    raw = message.text.strip().replace(",", ".")
+    try:
+        new_price = Decimal(raw)
+        if new_price <= 0:
+            raise ValueError
+    except (InvalidOperation, ValueError):
+        await message.answer("Некорректная цена. Введи положительное число, например <code>199</code>:", parse_mode="HTML")
+        return
+
+    sub = await session.get(Subscription, sub_id)
+    if not sub or sub.user_id != message.from_user.id:
+        await state.clear()
+        await message.answer("Подписка не найдена.")
+        return
+
+    sub.price = new_price
+    await session.commit()
+    await state.clear()
+
+    cats = await _get_user_categories(session, message.from_user.id)
+    cat_name = cats.get(sub.category_id) if sub.category_id else None
     await message.answer(
-        "Choose a category (optional):",
-        reply_markup=await _get_category_keyboard(session, message.from_user.id),
+        _build_detail_text(sub, cat_name),
+        reply_markup=sub_detail_keyboard(sub),
+        parse_mode="HTML",
     )
 
 
-@router.callback_query(F.data.startswith("cat_pick:"), AddSubStates.waiting_category)
-async def add_sub_category(callback: CallbackQuery, state: FSMContext, session: AsyncSession) -> None:
-    from datetime import date
-    cat_id_raw = callback.data.split(":")[1]
-    category_id = int(cat_id_raw) if cat_id_raw != "0" else None
+# ──────────────────────────────────────────────────────────────────────────────
+# Edit: PERIOD
+# ──────────────────────────────────────────────────────────────────────────────
+
+@router.callback_query(F.data.startswith("edit_sub_period:"))
+async def edit_period_ask(callback: CallbackQuery, state: FSMContext) -> None:
+    sub_id = int(callback.data.split(":")[1])
+    await state.update_data(sub_id=sub_id)
+    await state.set_state(EditSubscription.period)
+    await callback.message.edit_text(
+        "🔁 Выбери новый период:",
+        reply_markup=period_keyboard(sub_id),
+        parse_mode="HTML",
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("set_period:"), StateFilter(EditSubscription.period))
+async def edit_period_save(callback: CallbackQuery, state: FSMContext, session: AsyncSession) -> None:
+    _, new_period, sub_id_str = callback.data.split(":")
+    sub_id = int(sub_id_str)
+
+    sub = await session.get(Subscription, sub_id)
+    if not sub or sub.user_id != callback.from_user.id:
+        await state.clear()
+        await callback.answer("Подписка не найдена.", show_alert=True)
+        return
+
+    sub.period = new_period
+    await session.commit()
+    await state.clear()
+
+    cats = await _get_user_categories(session, callback.from_user.id)
+    cat_name = cats.get(sub.category_id) if sub.category_id else None
+    await callback.message.edit_text(
+        _build_detail_text(sub, cat_name),
+        reply_markup=sub_detail_keyboard(sub),
+        parse_mode="HTML",
+    )
+    await callback.answer()
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Edit: NEXT PAYMENT DATE
+# ──────────────────────────────────────────────────────────────────────────────
+
+@router.callback_query(F.data.startswith("edit_sub_date:"))
+async def edit_date_ask(callback: CallbackQuery, state: FSMContext) -> None:
+    sub_id = int(callback.data.split(":")[1])
+    await state.update_data(sub_id=sub_id)
+    await state.set_state(EditSubscription.next_payment)
+    await callback.message.edit_text(
+        "📅 Введи новую дату следующего списания в формате <code>ДД.ММ.ГГГГ</code>\n"
+        "Например: <code>24.03.2026</code>",
+        reply_markup=InlineKeyboardMarkup(
+            inline_keyboard=[[InlineKeyboardButton(text="⬅️ Отмена", callback_data=f"sub_detail:{sub_id}")]]
+        ),
+        parse_mode="HTML",
+    )
+    await callback.answer()
+
+
+@router.message(StateFilter(EditSubscription.next_payment))
+async def edit_date_save(message: Message, state: FSMContext, session: AsyncSession) -> None:
+    data = await state.get_data()
+    sub_id = data["sub_id"]
+
+    raw = message.text.strip()
+    try:
+        new_date = datetime.strptime(raw, "%d.%m.%Y").date()
+    except ValueError:
+        await message.answer(
+            "Неверный формат. Введи дату в виде <code>ДД.ММ.ГГГГ</code>, например <code>24.03.2026</code>:",
+            parse_mode="HTML",
+        )
+        return
+
+    sub = await session.get(Subscription, sub_id)
+    if not sub or sub.user_id != message.from_user.id:
+        await state.clear()
+        await message.answer("Подписка не найдена.")
+        return
+
+    sub.next_payment = new_date
+    await session.commit()
+    await state.clear()
+
+    cats = await _get_user_categories(session, message.from_user.id)
+    cat_name = cats.get(sub.category_id) if sub.category_id else None
+    await message.answer(
+        _build_detail_text(sub, cat_name),
+        reply_markup=sub_detail_keyboard(sub),
+        parse_mode="HTML",
+    )
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Edit: CATEGORY
+# ──────────────────────────────────────────────────────────────────────────────
+
+@router.callback_query(F.data.startswith("edit_sub_cat:"))
+async def edit_cat_ask(callback: CallbackQuery, state: FSMContext, session: AsyncSession) -> None:
+    sub_id = int(callback.data.split(":")[1])
+    await state.update_data(sub_id=sub_id)
+    await state.set_state(EditSubscription.category)
+
+    cats = await _get_user_categories(session, callback.from_user.id)
+    buttons: list[list[InlineKeyboardButton]] = []
+    for cat_id, cat_name in cats.items():
+        buttons.append(
+            [InlineKeyboardButton(text=cat_name, callback_data=f"set_cat:{cat_id}:{sub_id}")]
+        )
+    # Option to clear category
+    buttons.append(
+        [InlineKeyboardButton(text="— Без категории", callback_data=f"set_cat:0:{sub_id}")]
+    )
+    buttons.append(
+        [InlineKeyboardButton(text="⬅️ Отмена", callback_data=f"sub_detail:{sub_id}")]
+    )
+
+    if not cats:
+        text = (
+            "🗂 У тебя пока нет категорий.\n"
+            "Сначала создай категорию в разделе <b>Категории</b>."
+        )
+    else:
+        text = "🗂 Выбери категорию:"
+
+    await callback.message.edit_text(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons), parse_mode="HTML")
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("set_cat:"), StateFilter(EditSubscription.category))
+async def edit_cat_save(callback: CallbackQuery, state: FSMContext, session: AsyncSession) -> None:
+    parts = callback.data.split(":")
+    cat_id_raw = int(parts[1])
+    sub_id = int(parts[2])
+
+    sub = await session.get(Subscription, sub_id)
+    if not sub or sub.user_id != callback.from_user.id:
+        await state.clear()
+        await callback.answer("Подписка не найдена.", show_alert=True)
+        return
+
+    sub.category_id = None if cat_id_raw == 0 else cat_id_raw
+    await session.commit()
+    await state.clear()
+
+    cats = await _get_user_categories(session, callback.from_user.id)
+    cat_name = cats.get(sub.category_id) if sub.category_id else None
+    await callback.message.edit_text(
+        _build_detail_text(sub, cat_name),
+        reply_markup=sub_detail_keyboard(sub),
+        parse_mode="HTML",
+    )
+    await callback.answer()
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Delete with confirmation
+# ──────────────────────────────────────────────────────────────────────────────
+
+@router.callback_query(F.data.startswith("delete_sub_ask:"))
+async def delete_sub_ask(callback: CallbackQuery, session: AsyncSession) -> None:
+    sub_id = int(callback.data.split(":")[1])
+    sub = await session.get(Subscription, sub_id)
+    if not sub or sub.user_id != callback.from_user.id:
+        await callback.answer("Подписка не найдена.", show_alert=True)
+        return
+
+    await callback.message.edit_text(
+        f"🗑 Удалить подписку <b>{sub.name}</b>?\n\nЭто действие нельзя отменить.",
+        reply_markup=delete_confirm_keyboard(sub_id),
+        parse_mode="HTML",
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("delete_sub_confirm:"))
+async def delete_sub_confirm(callback: CallbackQuery, session: AsyncSession, state: FSMContext) -> None:
+    sub_id = int(callback.data.split(":")[1])
+    sub = await session.get(Subscription, sub_id)
+    if not sub or sub.user_id != callback.from_user.id:
+        await callback.answer("Подписка не найдена.", show_alert=True)
+        return
+
+    name = sub.name
+    await session.delete(sub)
+    await session.commit()
+    await state.clear()
+
+    # Return to the subscription list
+    subs = await _get_user_subs(session, callback.from_user.id)
+    text = _build_list_text(subs)
+    await callback.message.edit_text(
+        f"✅ Подписка <b>{name}</b> удалена.\n\n{text}",
+        reply_markup=subs_list_keyboard(subs),
+        parse_mode="HTML",
+    )
+    await callback.answer()
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# ADD SUBSCRIPTION flow
+# ──────────────────────────────────────────────────────────────────────────────
+
+@router.callback_query(F.data == "add_sub")
+async def add_sub_start(callback: CallbackQuery, state: FSMContext) -> None:
+    await state.clear()
+    await state.set_state(AddSubscription.name)
+    await callback.message.edit_text(
+        "➕ <b>Новая подписка</b>\n\nВведи название подписки:\n<i>(например: Netflix, Spotify, Figma)</i>",
+        reply_markup=InlineKeyboardMarkup(
+            inline_keyboard=[[InlineKeyboardButton(text="⬅️ Отмена", callback_data="back_to_main")]]
+        ),
+        parse_mode="HTML",
+    )
+    await callback.answer()
+
+
+@router.message(StateFilter(AddSubscription.name))
+async def add_sub_name(message: Message, state: FSMContext) -> None:
+    name = message.text.strip()
+    if not name:
+        await message.answer("Название не может быть пустым. Введи название подписки:")
+        return
+    await state.update_data(name=name)
+    await state.set_state(AddSubscription.price)
+    await message.answer(
+        f"💰 Цена <b>{name}</b>\n\nВведи сумму (например: <code>199</code> или <code>1505.50</code>):",
+        parse_mode="HTML",
+    )
+
+
+@router.message(StateFilter(AddSubscription.price))
+async def add_sub_price(message: Message, state: FSMContext) -> None:
+    raw = message.text.strip().replace(",", ".")
+    try:
+        price = Decimal(raw)
+        if price <= 0:
+            raise ValueError
+    except (InvalidOperation, ValueError):
+        await message.answer("Некорректная цена. Введи положительное число, например <code>199</code>:", parse_mode="HTML")
+        return
+    await state.update_data(price=str(price))
+    await state.set_state(AddSubscription.period)
+    await message.answer(
+        "🔁 Выбери период подписки:",
+        reply_markup=add_period_keyboard(),
+        parse_mode="HTML",
+    )
+
+
+@router.callback_query(F.data.startswith("set_add_period:"), StateFilter(AddSubscription.period))
+async def add_sub_period(callback: CallbackQuery, state: FSMContext, session: AsyncSession) -> None:
+    period = callback.data.split(":")[1]
+    await state.update_data(period=period)
+    await state.set_state(AddSubscription.category)
+
+    cats = await _get_user_categories(session, callback.from_user.id)
+    buttons: list[list[InlineKeyboardButton]] = []
+    for cat_id, cat_name in cats.items():
+        buttons.append(
+            [InlineKeyboardButton(text=cat_name, callback_data=f"add_cat:{cat_id}")]
+        )
+    buttons.append([InlineKeyboardButton(text="— Без категории", callback_data="add_cat:0")])
+
+    await callback.message.edit_text(
+        "🗂 Выбери категорию (или пропусти):",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons),
+        parse_mode="HTML",
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("add_cat:"), StateFilter(AddSubscription.category))
+async def add_sub_category(callback: CallbackQuery, state: FSMContext) -> None:
+    cat_id_raw = int(callback.data.split(":")[1])
+    await state.update_data(category_id=None if cat_id_raw == 0 else cat_id_raw)
+    await state.set_state(AddSubscription.next_payment)
+    await callback.message.edit_text(
+        "📅 Введи дату следующего списания в формате <code>ДД.ММ.ГГГГ</code>\n"
+        "Например: <code>24.03.2026</code>",
+        parse_mode="HTML",
+    )
+    await callback.answer()
+
+
+@router.message(StateFilter(AddSubscription.next_payment))
+async def add_sub_next_payment(message: Message, state: FSMContext, session: AsyncSession) -> None:
+    raw = message.text.strip()
+    try:
+        next_payment = datetime.strptime(raw, "%d.%m.%Y").date()
+    except ValueError:
+        await message.answer(
+            "Неверный формат. Введи дату в виде <code>ДД.ММ.ГГГГ</code>, например <code>24.03.2026</code>:",
+            parse_mode="HTML",
+        )
+        return
 
     data = await state.get_data()
     sub = Subscription(
-        user_id=callback.from_user.id,
+        user_id=message.from_user.id,
         name=data["name"],
-        amount=Decimal(data["amount"]),
-        currency=data["currency"],
-        billing_cycle=data["billing_cycle"],
-        next_billing_date=date.fromisoformat(data["next_billing_date"]),
-        category_id=category_id,
-        is_active=True,
+        price=Decimal(data["price"]),
+        period=data["period"],
+        category_id=data.get("category_id"),
+        next_payment=next_payment,
     )
     session.add(sub)
     await session.commit()
     await state.clear()
-    await callback.message.answer(
-        f"✅ Subscription <b>{sub.name}</b> added!"
-    )
-    await callback.answer()
 
-
-# ─── Edit subscription FSM ─────────────────────────────────────────────────────
-
-
-@router.callback_query(F.data.startswith("sub:edit:"))
-async def cb_edit_start(callback: CallbackQuery, state: FSMContext, session: AsyncSession) -> None:
-    sub_id = int(callback.data.split(":")[2])
-    sub = await session.get(Subscription, sub_id)
-    if not sub or sub.user_id != callback.from_user.id:
-        await callback.answer("Not found.", show_alert=True)
-        return
-
-    await state.set_state(EditSubStates.choosing_field)
-    await state.update_data(sub_id=sub_id)
-
-    await callback.message.answer(
-        f"Editing <b>{sub.name}</b>. What would you like to change?",
+    period_label = PERIOD_LABELS.get(sub.period, sub.period)
+    await message.answer(
+        f"✅ Подписка <b>{sub.name}</b> добавлена!\n\n"
+        f"💰 {fmt_price(sub.price)} ₽ — {period_label}\n"
+        f"📅 Следующее списание: {full_date(next_payment)}",
         reply_markup=InlineKeyboardMarkup(
             inline_keyboard=[
-                [InlineKeyboardButton(text="Name",          callback_data="edit_field:name")],
-                [InlineKeyboardButton(text="Amount",        callback_data="edit_field:amount")],
-                [InlineKeyboardButton(text="Currency",      callback_data="edit_field:currency")],
-                [InlineKeyboardButton(text="Billing cycle", callback_data="edit_field:billing_cycle")],
-                [InlineKeyboardButton(text="Next date",     callback_data="edit_field:next_date")],
-                [InlineKeyboardButton(text="Category",      callback_data="edit_field:category")],
-                [InlineKeyboardButton(text="❌ Cancel",      callback_data="edit_field:cancel")],
+                [InlineKeyboardButton(text="📋 Мои подписки", callback_data="my_subs")],
+                [InlineKeyboardButton(text="⬅️ В меню", callback_data="back_to_main")],
             ]
         ),
+        parse_mode="HTML",
     )
-    await callback.answer()
-
-
-@router.callback_query(F.data.startswith("edit_field:"), EditSubStates.choosing_field)
-async def cb_edit_field(callback: CallbackQuery, state: FSMContext, session: AsyncSession) -> None:
-    field = callback.data.split(":")[1]
-    if field == "cancel":
-        await state.clear()
-        await callback.message.edit_text("Edit cancelled.")
-        await callback.answer()
-        return
-
-    await state.update_data(field=field)
-
-    if field == "billing_cycle":
-        await state.set_state(EditSubStates.waiting_new_value)
-        await callback.message.answer("Choose new billing cycle:", reply_markup=_billing_keyboard())
-    elif field == "category":
-        await state.set_state(EditSubStates.waiting_new_value)
-        user_id = callback.from_user.id
-        await callback.message.answer(
-            "Choose new category:",
-            reply_markup=await _get_category_keyboard(session, user_id),
-        )
-    else:
-        prompts = {
-            "name":     "Enter new name:",
-            "amount":   "Enter new amount (e.g. 9.99):",
-            "currency": "Enter new currency (e.g. USD):",
-            "next_date": "Enter new next billing date (YYYY-MM-DD):",
-        }
-        await state.set_state(EditSubStates.waiting_new_value)
-        await callback.message.answer(prompts.get(field, "Enter new value:"))
-    await callback.answer()
-
-
-@router.message(EditSubStates.waiting_new_value)
-async def edit_sub_text_value(message: Message, state: FSMContext, session: AsyncSession) -> None:
-    from datetime import date
-    data = await state.get_data()
-    sub_id = data["sub_id"]
-    field  = data["field"]
-    value  = message.text.strip()
-
-    sub = await session.get(Subscription, sub_id)
-    if not sub or sub.user_id != message.from_user.id:
-        await message.answer("Subscription not found.")
-        await state.clear()
-        return
-
-    if field == "name":
-        sub.name = value
-    elif field == "amount":
-        try:
-            sub.amount = Decimal(value.replace(",", "."))
-        except InvalidOperation:
-            await message.answer("⚠️ Invalid amount.")
-            return
-    elif field == "currency":
-        sub.currency = value.upper()
-    elif field == "next_date":
-        try:
-            sub.next_billing_date = date.fromisoformat(value)
-        except ValueError:
-            await message.answer("⚠️ Invalid date (use YYYY-MM-DD).")
-            return
-
-    await session.commit()
-    await state.clear()
-    await message.answer(f"✅ <b>{sub.name}</b> updated successfully!")
-
-
-@router.callback_query(F.data.startswith("billing:"), EditSubStates.waiting_new_value)
-async def edit_sub_billing(callback: CallbackQuery, state: FSMContext, session: AsyncSession) -> None:
-    data = await state.get_data()
-    sub = await session.get(Subscription, data["sub_id"])
-    if sub and sub.user_id == callback.from_user.id:
-        sub.billing_cycle = callback.data.split(":")[1]
-        await session.commit()
-        await callback.message.answer(f"✅ <b>{sub.name}</b> billing cycle updated!")
-    await state.clear()
-    await callback.answer()
-
-
-@router.callback_query(F.data.startswith("cat_pick:"), EditSubStates.waiting_new_value)
-async def edit_sub_category(callback: CallbackQuery, state: FSMContext, session: AsyncSession) -> None:
-    data = await state.get_data()
-    sub = await session.get(Subscription, data["sub_id"])
-    if sub and sub.user_id == callback.from_user.id:
-        cat_id_raw = callback.data.split(":")[1]
-        sub.category_id = int(cat_id_raw) if cat_id_raw != "0" else None
-        await session.commit()
-        await callback.message.answer(f"✅ <b>{sub.name}</b> category updated!")
-    await state.clear()
-    await callback.answer()

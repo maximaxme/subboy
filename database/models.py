@@ -39,6 +39,7 @@ class Subscription(Base):
     period: Mapped[str] = mapped_column(String) # 'monthly', 'yearly'
     next_payment: Mapped[date] = mapped_column(Date)
     created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
+    is_active: Mapped[bool] = mapped_column(Boolean, default=True, server_default="true")
 
     user: Mapped["User"] = relationship(back_populates="subscriptions")
     category: Mapped["Category"] = relationship(back_populates="subscriptions")
