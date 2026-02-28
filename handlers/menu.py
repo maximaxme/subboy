@@ -1,16 +1,19 @@
-from aiogram import Router
-from aiogram.filters import Command
-from aiogram.types import Message
-from aiogram.fsm.context import FSMContext
+"""
+handlers/menu.py — Re-usable main menu helper.
+"""
+from __future__ import annotations
 
-from keyboards.main_menu import main_menu_keyboard
+from aiogram.types import Message, ReplyKeyboardMarkup, KeyboardButton
 
-router = Router()
 
-@router.message(Command("menu"))
-async def show_menu(message: Message, state: FSMContext):
-    await state.clear()
-    await message.answer(
-        "👋 Чем займёмся?",
-        reply_markup=main_menu_keyboard()
-    )
+MAIN_MENU = ReplyKeyboardMarkup(
+    keyboard=[
+        [KeyboardButton(text="📋 My Subscriptions"), KeyboardButton(text="📊 Reports")],
+        [KeyboardButton(text="🏷 Categories"),       KeyboardButton(text="⚙️ Settings")],
+    ],
+    resize_keyboard=True,
+)
+
+
+async def send_main_menu(message: Message, text: str = "Main menu:") -> None:
+    await message.answer(text, reply_markup=MAIN_MENU)

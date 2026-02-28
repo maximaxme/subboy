@@ -1,29 +1,36 @@
+"""
+services/user_service.py — User registration and retrieval.
+"""
+from __future__ import annotations
+
+from typing import Optional
+
 from sqlalchemy.ext.asyncio import AsyncSession
-from database.models import User, NotificationSettings
-from sqlalchemy import select
+
+from database.models import User
+
 
 async def get_or_create_user(
     session: AsyncSession,
-    user_id: int,
-    username: str | None = None,
-    full_name: str | None = None
+    telegram_id: int,
+    username: Optional[str],
+    first_name: Optional[str],
 ) -> User:
-    stmt = select(User).where(User.id == user_id)
-    result = await session.execute(stmt)
-    user = result.scalar_one_or_none()
-
-    if not user:
+    """
+    Retrieve an existing user or create a new one.
+    Sets `user.is_new = True` if the user was just created.
+    """
+    user = await session.get(User, telegram_id)
+    if user is None:
         user = User(
-            id=user_id,
+            telegram_id=telegram_id,
             username=username,
-            full_name=full_name
+            first_name=first_name,
         )
         session.add(user)
-        
-        # Добавляем настройки уведомлений по умолчанию
-        settings = NotificationSettings(user_id=user_id)
-        session.add(settings)
-        
         await session.commit()
-    
+        await session.refresh(user)
+        user.is_new = True  # transient flag
+    else:
+        user.is_new = False
     return user
