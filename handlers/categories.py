@@ -1,189 +1,208 @@
 """
-handlers/categories.py — Category management (create, list, rename, delete).
+handlers/categories.py — Category management (create, list, delete).
 """
 from __future__ import annotations
 
-import logging
-
-from aiogram import Router, F
-from aiogram.filters import Command
+from aiogram import F, Router
+from aiogram.filters import StateFilter
 from aiogram.fsm.context import FSMContext
 from aiogram.types import (
-    Message,
     CallbackQuery,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
+    Message,
 )
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from database.models import Category, Subscription
-from utils.states import CategoryStates
+from utils.states import ManageCategories
 
-logger = logging.getLogger(__name__)
-router = Router(name="categories")
-
-
-# ─── Helpers ───────────────────────────────────────────────────────────────────
+router = Router()
 
 
-def _categories_keyboard(categories: list[Category]) -> InlineKeyboardMarkup:
-    rows = []
-    for cat in categories:
-        rows.append([
-            InlineKeyboardButton(text=cat.name,          callback_data=f"cat:view:{cat.id}"),
-            InlineKeyboardButton(text="✏️ Rename",        callback_data=f"cat:rename:{cat.id}"),
-            InlineKeyboardButton(text="🗑 Delete",         callback_data=f"cat:delete:{cat.id}"),
-        ])
-    rows.append([InlineKeyboardButton(text="➕ New Category", callback_data="cat:new")])
-    return InlineKeyboardMarkup(inline_keyboard=rows)
+def categories_keyboard(cats: list[Category]) -> InlineKeyboardMarkup:
+    buttons: list[list[InlineKeyboardButton]] = []
+    for cat in cats:
+        buttons.append(
+            [
+                InlineKeyboardButton(text=cat.name, callback_data=f"cat_detail:{cat.id}"),
+            ]
+        )
+    buttons.append(
+        [InlineKeyboardButton(text="➕ Новая категория", callback_data="add_category")]
+    )
+    buttons.append(
+        [InlineKeyboardButton(text="⬅️ Назад", callback_data="back_to_main")]
+    )
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
 
 
-async def _send_categories(target: Message | CallbackQuery, session: AsyncSession) -> None:
-    """Send or edit the categories list."""
-    if isinstance(target, CallbackQuery):
-        user_id = target.from_user.id
-        send = target.message.edit_text
-    else:
-        user_id = target.from_user.id
-        send = target.answer
+def cat_detail_keyboard(cat_id: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="🗑 Удалить категорию", callback_data=f"delete_cat_ask:{cat_id}")],
+            [InlineKeyboardButton(text="⬅️ К категориям", callback_data="categories")],
+        ]
+    )
 
+
+def cat_delete_confirm_keyboard(cat_id: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(text="✅ Да, удалить", callback_data=f"delete_cat_confirm:{cat_id}"),
+                InlineKeyboardButton(text="❌ Отмена", callback_data=f"cat_detail:{cat_id}"),
+            ]
+        ]
+    )
+
+
+async def _get_user_cats(session: AsyncSession, user_id: int) -> list[Category]:
     result = await session.execute(
         select(Category).where(Category.user_id == user_id).order_by(Category.name)
     )
-    categories = result.scalars().all()
-
-    if not categories:
-        text = "You have no categories yet. Create one!"
-    else:
-        text = "<b>Your Categories</b>\n\n" + "\n".join(f"  • {c.name}" for c in categories)
-
-    await send(text, reply_markup=_categories_keyboard(categories))
+    return list(result.scalars().all())
 
 
-# ─── Entry ─────────────────────────────────────────────────────────────────────
-
-
-@router.message(Command("categories"))
-@router.message(F.text == "🏷 Categories")
-async def cmd_categories(message: Message, session: AsyncSession, state: FSMContext) -> None:
+@router.callback_query(F.data == "categories")
+async def show_categories(callback: CallbackQuery, session: AsyncSession, state: FSMContext) -> None:
     await state.clear()
-    await _send_categories(message, session)
-
-
-# ─── View ──────────────────────────────────────────────────────────────────────
-
-
-@router.callback_query(F.data.startswith("cat:view:"))
-async def cb_cat_view(callback: CallbackQuery, session: AsyncSession) -> None:
-    cat_id = int(callback.data.split(":")[2])
-    cat = await session.get(Category, cat_id)
-    if not cat or cat.user_id != callback.from_user.id:
-        await callback.answer("Not found.", show_alert=True)
-        return
-    result = await session.execute(
-        select(Subscription).where(Subscription.category_id == cat_id)
+    cats = await _get_user_cats(session, callback.from_user.id)
+    if cats:
+        text = "🗂 <b>Твои категории:</b>\n\nНажми на категорию для управления."
+    else:
+        text = (
+            "🗂 <b>Категории</b>\n\n"
+            "У тебя пока нет категорий.\n"
+            "Создай первую, нажав <b>➕ Новая категория</b>."
+        )
+    await callback.message.edit_text(
+        text,
+        reply_markup=categories_keyboard(cats),
+        parse_mode="HTML",
     )
-    subs = result.scalars().all()
-    sub_list = "\n".join(f"    – {s.name}" for s in subs) or "    (none)"
-    await callback.answer(
-        f"{cat.name}\nSubscriptions:\n{sub_list}",
-        show_alert=True,
-    )
-
-
-# ─── New ───────────────────────────────────────────────────────────────────────
-
-
-@router.callback_query(F.data == "cat:new")
-async def cb_cat_new(callback: CallbackQuery, state: FSMContext) -> None:
-    await state.set_state(CategoryStates.waiting_name)
-    await callback.message.answer("Enter a name for the new category:")
     await callback.answer()
 
 
-@router.message(CategoryStates.waiting_name)
-async def cat_create(message: Message, state: FSMContext, session: AsyncSession) -> None:
+@router.callback_query(F.data.startswith("cat_detail:"))
+async def show_cat_detail(callback: CallbackQuery, session: AsyncSession) -> None:
+    cat_id = int(callback.data.split(":")[1])
+    cat = await session.get(Category, cat_id)
+    if not cat or cat.user_id != callback.from_user.id:
+        await callback.answer("Категория не найдена.", show_alert=True)
+        return
+
+    # Count subscriptions in this category
+    result = await session.execute(
+        select(Subscription).where(
+            Subscription.user_id == callback.from_user.id,
+            Subscription.category_id == cat_id,
+        )
+    )
+    subs = list(result.scalars().all())
+    subs_count = len(subs)
+
+    await callback.message.edit_text(
+        f"🗂 <b>{cat.name}</b>\n\n"
+        f"Подписок в категории: {subs_count}",
+        reply_markup=cat_detail_keyboard(cat_id),
+        parse_mode="HTML",
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data == "add_category")
+async def add_category_start(callback: CallbackQuery, state: FSMContext) -> None:
+    await state.set_state(ManageCategories.name)
+    await callback.message.edit_text(
+        "🗂 Введи название новой категории:",
+        reply_markup=InlineKeyboardMarkup(
+            inline_keyboard=[[InlineKeyboardButton(text="⬅️ Отмена", callback_data="categories")]]
+        ),
+        parse_mode="HTML",
+    )
+    await callback.answer()
+
+
+@router.message(StateFilter(ManageCategories.name))
+async def add_category_save(message: Message, state: FSMContext, session: AsyncSession) -> None:
     name = message.text.strip()
     if not name:
-        await message.answer("Name cannot be empty.")
+        await message.answer("Название не может быть пустым. Введи название категории:")
         return
+
+    # Check for duplicates
+    result = await session.execute(
+        select(Category).where(
+            Category.user_id == message.from_user.id,
+            Category.name == name,
+        )
+    )
+    existing = result.scalar_one_or_none()
+    if existing:
+        await message.answer(
+            f"Категория <b>{name}</b> уже существует. Введи другое название:",
+            parse_mode="HTML",
+        )
+        return
+
     cat = Category(user_id=message.from_user.id, name=name)
     session.add(cat)
     await session.commit()
     await state.clear()
-    await message.answer(f"✅ Category <b>{name}</b> created!")
-    await _send_categories(message, session)
+
+    cats = await _get_user_cats(session, message.from_user.id)
+    await message.answer(
+        f"✅ Категория <b>{name}</b> создана.\n\n🗂 <b>Твои категории:</b>",
+        reply_markup=categories_keyboard(cats),
+        parse_mode="HTML",
+    )
 
 
-# ─── Rename ────────────────────────────────────────────────────────────────────
-
-
-@router.callback_query(F.data.startswith("cat:rename:"))
-async def cb_cat_rename_start(callback: CallbackQuery, state: FSMContext) -> None:
-    cat_id = int(callback.data.split(":")[2])
-    await state.set_state(CategoryStates.waiting_rename)
-    await state.update_data(cat_id=cat_id)
-    await callback.message.answer("Enter the new name for this category:")
-    await callback.answer()
-
-
-@router.message(CategoryStates.waiting_rename)
-async def cat_rename(message: Message, state: FSMContext, session: AsyncSession) -> None:
-    data = await state.get_data()
-    cat = await session.get(Category, data["cat_id"])
-    if not cat or cat.user_id != message.from_user.id:
-        await message.answer("Category not found.")
-        await state.clear()
-        return
-    old_name = cat.name
-    cat.name = message.text.strip()
-    await session.commit()
-    await state.clear()
-    await message.answer(f"✅ Renamed <b>{old_name}</b> → <b>{cat.name}</b>")
-    await _send_categories(message, session)
-
-
-# ─── Delete ────────────────────────────────────────────────────────────────────
-
-
-@router.callback_query(F.data.startswith("cat:delete:"))
-async def cb_cat_delete_confirm(callback: CallbackQuery, session: AsyncSession) -> None:
-    cat_id = int(callback.data.split(":")[2])
+@router.callback_query(F.data.startswith("delete_cat_ask:"))
+async def delete_cat_ask(callback: CallbackQuery, session: AsyncSession) -> None:
+    cat_id = int(callback.data.split(":")[1])
     cat = await session.get(Category, cat_id)
     if not cat or cat.user_id != callback.from_user.id:
-        await callback.answer("Not found.", show_alert=True)
+        await callback.answer("Категория не найдена.", show_alert=True)
         return
-    await callback.message.answer(
-        f"Delete category <b>{cat.name}</b>? Subscriptions in it will become uncategorised.",
-        reply_markup=InlineKeyboardMarkup(
-            inline_keyboard=[[
-                InlineKeyboardButton(text="✅ Yes",    callback_data=f"cat:del_confirm:{cat_id}"),
-                InlineKeyboardButton(text="❌ Cancel", callback_data="cat:del_cancel"),
-            ]]
-        ),
+
+    await callback.message.edit_text(
+        f"🗑 Удалить категорию <b>{cat.name}</b>?\n\n"
+        "Подписки из категории не удаляются — они просто останутся без категории.",
+        reply_markup=cat_delete_confirm_keyboard(cat_id),
+        parse_mode="HTML",
     )
     await callback.answer()
 
 
-@router.callback_query(F.data.startswith("cat:del_confirm:"))
-async def cb_cat_delete_execute(callback: CallbackQuery, session: AsyncSession) -> None:
-    cat_id = int(callback.data.split(":")[2])
+@router.callback_query(F.data.startswith("delete_cat_confirm:"))
+async def delete_cat_confirm(callback: CallbackQuery, session: AsyncSession) -> None:
+    cat_id = int(callback.data.split(":")[1])
     cat = await session.get(Category, cat_id)
-    if cat and cat.user_id == callback.from_user.id:
-        # Unlink subscriptions
-        result = await session.execute(
-            select(Subscription).where(Subscription.category_id == cat_id)
+    if not cat or cat.user_id != callback.from_user.id:
+        await callback.answer("Категория не найдена.", show_alert=True)
+        return
+
+    # Detach subscriptions from this category
+    result = await session.execute(
+        select(Subscription).where(
+            Subscription.user_id == callback.from_user.id,
+            Subscription.category_id == cat_id,
         )
-        for sub in result.scalars().all():
-            sub.category_id = None
-        await session.delete(cat)
-        await session.commit()
-        await callback.message.edit_text(f"🗑 Category <b>{cat.name}</b> deleted.")
-    await callback.answer()
+    )
+    for sub in result.scalars().all():
+        sub.category_id = None
 
+    name = cat.name
+    await session.delete(cat)
+    await session.commit()
 
-@router.callback_query(F.data == "cat:del_cancel")
-async def cb_cat_delete_cancel(callback: CallbackQuery) -> None:
-    await callback.message.edit_text("Deletion cancelled.")
+    cats = await _get_user_cats(session, callback.from_user.id)
+    await callback.message.edit_text(
+        f"✅ Категория <b>{name}</b> удалена.\n\n🗂 <b>Твои категории:</b>",
+        reply_markup=categories_keyboard(cats),
+        parse_mode="HTML",
+    )
     await callback.answer()
