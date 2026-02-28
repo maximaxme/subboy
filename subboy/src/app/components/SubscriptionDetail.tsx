@@ -1,4 +1,4 @@
-import { CreditCard, Calendar, Tag, DollarSign, Bell, Trash2, ArrowLeft } from 'lucide-react'
+import { CreditCard, Calendar, Tag, DollarSign, Trash2, ArrowLeft } from 'lucide-react'
 import { getSubscriptionColor } from './SubscriptionCard'
 
 type SubWithCategory = {

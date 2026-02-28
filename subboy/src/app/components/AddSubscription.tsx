@@ -1,7 +1,6 @@
 import { useState } from 'react'
 import { ArrowLeft, Save } from 'lucide-react'
 import type { CategoryApi } from '@/app/api'
-import { getSubscriptionColor } from './SubscriptionCard'
 
 const SUBSCRIPTION_COLORS = ['#6366f1', '#8b5cf6', '#ec4899', '#f59e0b', '#10b981', '#06b6d4', '#ef4444'] as const
 
