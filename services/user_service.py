@@ -1,29 +1,51 @@
+"""
+services/user_service.py — User registration and lookup helpers.
+"""
+from __future__ import annotations
+
 from sqlalchemy.ext.asyncio import AsyncSession
-from database.models import User, NotificationSettings
-from sqlalchemy import select
+
+from database.models import NotificationSettings, User
+
 
 async def get_or_create_user(
     session: AsyncSession,
-    user_id: int,
-    username: str | None = None,
-    full_name: str | None = None
+    telegram_id: int,
+    username: str | None,
+    full_name: str | None,
 ) -> User:
-    stmt = select(User).where(User.id == user_id)
-    result = await session.execute(stmt)
-    user = result.scalar_one_or_none()
-
-    if not user:
+    """
+    Return the existing User record or create a new one.
+    Also creates default NotificationSettings (day_before=True) for new users.
+    """
+    user = await session.get(User, telegram_id)
+    if user is None:
         user = User(
-            id=user_id,
+            id=telegram_id,
             username=username,
-            full_name=full_name
+            full_name=full_name,
         )
         session.add(user)
-        
-        # Добавляем настройки уведомлений по умолчанию
-        settings = NotificationSettings(user_id=user_id)
-        session.add(settings)
-        
+
+        # Default notification settings for new users
+        ns = NotificationSettings(
+            user_id=telegram_id,
+            day_before=True,
+            weekly=False,
+            monthly=False,
+        )
+        session.add(ns)
         await session.commit()
-    
+    else:
+        # Keep username/full_name up to date
+        changed = False
+        if user.username != username:
+            user.username = username
+            changed = True
+        if user.full_name != full_name:
+            user.full_name = full_name
+            changed = True
+        if changed:
+            await session.commit()
+
     return user

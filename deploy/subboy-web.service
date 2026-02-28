@@ -1,0 +1,16 @@
+[Unit]
+Description=Subboy Web API (FastAPI + frontend)
+After=network.target postgresql.service
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/opt/apps/subboy
+EnvironmentFile=/etc/subboy/.env
+Environment="PATH=/opt/apps/subboy/venv/bin:/usr/local/bin:/usr/bin:/bin"
+ExecStart=/opt/apps/subboy/venv/bin/uvicorn web.main:app --host 0.0.0.0 --port 8000
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target

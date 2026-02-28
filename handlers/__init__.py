@@ -5,9 +5,9 @@ from .reports import router as reports_router
 from .settings import router as settings_router
 
 __all__ = [
-    "start_router", 
-    "subscriptions_router", 
-    "categories_router", 
+    "start_router",
+    "subscriptions_router",
+    "categories_router",
     "reports_router",
-    "settings_router"
+    "settings_router",
 ]

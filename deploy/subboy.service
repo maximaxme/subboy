@@ -1,0 +1,16 @@
+[Unit]
+Description=Subboy Telegram Bot
+After=network.target postgresql.service
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/opt/apps/subboy
+EnvironmentFile=/etc/subboy/.env
+Environment="PATH=/opt/apps/subboy/venv/bin:/usr/local/bin:/usr/bin:/bin"
+ExecStart=/opt/apps/subboy/venv/bin/python bot.py
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target
