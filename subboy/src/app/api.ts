@@ -32,6 +32,7 @@ export type SubscriptionApi = {
   price: string
   period: string
   next_payment: string
+  is_active: boolean
   created_at: string
 }
 
@@ -43,6 +44,10 @@ export const subscriptions = {
   list: () => api<SubscriptionApi[]>('/subscriptions'),
   create: (body: { name: string; price: number; period: string; category_id?: number; next_payment: string }) =>
     api<SubscriptionApi>('/subscriptions', { method: 'POST', body: JSON.stringify(body) }),
+  update: (id: number, body: { name?: string; price?: number; period?: string; next_payment?: string; category_id?: number | null }) =>
+    api<SubscriptionApi>(`/subscriptions/${id}`, { method: 'PUT', body: JSON.stringify(body) }),
+  toggle: (id: number) =>
+    api<SubscriptionApi>(`/subscriptions/${id}/toggle`, { method: 'PATCH' }),
   delete: (id: number) => api<{ ok: boolean }>(`/subscriptions/${id}`, { method: 'DELETE' }),
 }
 

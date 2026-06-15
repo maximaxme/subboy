@@ -36,12 +36,40 @@ class Subscription(Base):
     category_id: Mapped[int | None] = mapped_column(ForeignKey("categories.id", ondelete="SET NULL"))
     name: Mapped[str] = mapped_column(String)
     price: Mapped[Decimal] = mapped_column(Numeric(10, 2))
+    price_currency: Mapped[str] = mapped_column(String, default="RUB", server_default="RUB")
+    price_original: Mapped[Decimal | None] = mapped_column(Numeric(10, 2), nullable=True)
     period: Mapped[str] = mapped_column(String) # 'monthly', 'yearly'
     next_payment: Mapped[date] = mapped_column(Date)
     created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
+    is_active: Mapped[bool] = mapped_column(Boolean, default=True, server_default="true")
+    # When True, the "still using this?" question before a charge is skipped
+    # (for subscriptions you always keep, e.g. Yandex Music).
+    always_keep: Mapped[bool] = mapped_column(Boolean, default=False, server_default="false")
 
     user: Mapped["User"] = relationship(back_populates="subscriptions")
     category: Mapped["Category"] = relationship(back_populates="subscriptions")
+
+class Payment(Base):
+    """A single charge that occurred for a subscription.
+
+    Logged automatically when a subscription's next_payment date passes. Fields are
+    denormalised (name/amount/currency snapshot) so history survives a subscription
+    being renamed or deleted.
+    """
+    __tablename__ = "payments"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), index=True)
+    subscription_id: Mapped[int | None] = mapped_column(
+        ForeignKey("subscriptions.id", ondelete="SET NULL"), nullable=True
+    )
+    name: Mapped[str] = mapped_column(String)
+    amount: Mapped[Decimal] = mapped_column(Numeric(10, 2))
+    currency: Mapped[str] = mapped_column(String, default="RUB", server_default="RUB")
+    amount_original: Mapped[Decimal | None] = mapped_column(Numeric(10, 2), nullable=True)
+    paid_on: Mapped[date] = mapped_column(Date, index=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
+
 
 class NotificationSettings(Base):
     __tablename__ = "notification_settings"

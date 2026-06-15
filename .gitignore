@@ -1,16 +1,13 @@
-# Секреты — не коммитить
-.env
-.env.*
-CREDENTIALS.md
-
-# Node
-node_modules/
-
 # Python
 venv/
 __pycache__/
 *.pyc
 *.pyo
+
+# Node / frontend
+node_modules/
+subboy/dist/
+subboy/build/
 
 # Build / dist
 dist/
@@ -22,3 +19,12 @@ build/
 *.swp
 *.swo
 .DS_Store
+
+# Backups / scratch
+*.bak
+*.bak-*
+*.orig
+
+# Secrets / local env
+.env
+.env.*

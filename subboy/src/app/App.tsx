@@ -109,6 +109,35 @@ export default function App() {
     }
   }
 
+  const handleToggleSub = async () => {
+    if (!selectedSub) return
+    const updated = await api.subscriptions.toggle(selectedSub.id)
+    setSelectedSub((prev) => prev ? { ...prev, is_active: updated.is_active } : prev)
+    setSubscriptions((prev) => prev.map((s) => s.id === updated.id ? { ...s, is_active: updated.is_active } : s))
+  }
+
+  const handleUpdateSub = async (data: {
+    name: string
+    price: number
+    period: string
+    next_payment: string
+    category_id: number | null
+  }) => {
+    if (!selectedSub) return
+    const updated = await api.subscriptions.update(selectedSub.id, {
+      name: data.name,
+      price: data.price,
+      period: data.period,
+      next_payment: data.next_payment,
+      category_id: data.category_id ?? undefined,
+    })
+    const catName = data.category_id ? categories.find((c) => c.id === data.category_id)?.name : undefined
+    const withCat = { ...updated, categoryName: catName }
+    setSelectedSub(withCat)
+    setSubscriptions((prev) => prev.map((s) => s.id === updated.id ? updated : s))
+    await loadData()
+  }
+
   const handleAddSubmit = async (data: {
     name: string
     price: number
@@ -135,7 +164,6 @@ export default function App() {
   }
 
   if (screen === 'login') {
-    const isLocalhost = /^https?:\/\/(localhost|127\.0\.0\.1)(:\d+)?$/i.test(window.location.origin)
     return (
       <div className="dark min-h-screen bg-background">
         <div className="max-w-md mx-auto bg-background min-h-screen border-x border-border p-4 flex flex-col items-center justify-center">
@@ -144,9 +172,7 @@ export default function App() {
             Учёт подписок — те же данные, что и в боте
           </p>
           <p className="text-sm text-muted-foreground text-center mb-4">
-            {isLocalhost
-              ? 'На localhost: введите Telegram user id (узнать в @userinfobot) и нажмите «Войти».'
-              : 'Войдите через кнопку «Login with Telegram» (нужен HTTPS) или по user id.'}
+            Введите Telegram user id (узнать в @userinfobot) и нажмите «Войти»
           </p>
           <input
             type="number"
@@ -160,7 +186,7 @@ export default function App() {
             onClick={handleDevLogin}
             className="w-full max-w-xs bg-foreground text-background py-3 rounded-lg hover:opacity-90 transition-opacity"
           >
-            Войти по id
+            Войти
           </button>
           {loginError && <p className="text-destructive text-sm mt-2">{loginError}</p>}
         </div>
@@ -189,9 +215,12 @@ export default function App() {
         <div className="max-w-md mx-auto bg-background min-h-screen border-x border-border">
           <SubscriptionDetail
             subscription={selectedSub}
+            categories={categories}
             colorIndex={colorIndex >= 0 ? colorIndex : 0}
             onBack={() => { setSelectedSub(null); setScreen('home') }}
             onDelete={handleDeleteSub}
+            onToggle={handleToggleSub}
+            onUpdate={handleUpdateSub}
           />
         </div>
       </div>
@@ -220,7 +249,7 @@ export default function App() {
           >
             <Menu className="w-5 h-5 text-foreground" />
           </button>
-          <span className="text-foreground font-medium">Subscriptions</span>
+          <span className="text-foreground font-medium">Subboy</span>
           <button
             type="button"
             onClick={() => setScreen('add')}
@@ -235,13 +264,13 @@ export default function App() {
           <div className="grid grid-cols-2 gap-3">
             <StatsCard
               label="В месяц"
-              value={`${monthlyTotal.toFixed(2)} ₽`}
+              value={`${monthlyTotal.toFixed(0)} ₽`}
               icon={<DollarSign className="w-4 h-4" />}
             />
-            <StatsCard label="В год" value={`${yearlyTotal.toFixed(2)} ₽`} />
+            <StatsCard label="В год" value={`${yearlyTotal.toFixed(0)} ₽`} />
             <StatsCard
-              label="Active Services"
-              value={String(subscriptions.length)}
+              label="Подписок"
+              value={String(subscriptions.filter((s) => s.is_active).length)}
               icon={<DollarSign className="w-4 h-4" />}
               className="col-span-2"
             />

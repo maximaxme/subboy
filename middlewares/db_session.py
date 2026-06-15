@@ -13,4 +13,12 @@ class DbSessionMiddleware(BaseMiddleware):
     ) -> Any:
         async with db_helper.session_factory() as session:
             data["session"] = session
-            return await handler(event, data)
+            try:
+                result = await handler(event, data)
+                # Commit any work the handler left uncommitted, then end the
+                # transaction so the connection doesn't linger "idle in transaction".
+                await session.commit()
+                return result
+            except Exception:
+                await session.rollback()
+                raise

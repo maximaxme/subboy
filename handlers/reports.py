@@ -3,9 +3,10 @@ handlers/reports.py — Subscription expense reports.
 
 Provides:
 - "📊 Отчёты" menu
-- "📅 Этот месяц" quick report
-- "📆 Следующий месяц" report
-- "💰 Всего за всё время" summary
+- "📅 Этот месяц" / "📆 Следующий месяц" forecasts
+- "📆 Год" report (actual spend from payment history + annual projection)
+- "💰 Ежемесячные расходы" summary
+- "🧾 История платежей" with per-payment delete
 """
 from __future__ import annotations
 
@@ -19,35 +20,22 @@ from aiogram.types import (
     InlineKeyboardButton,
     InlineKeyboardMarkup,
 )
+from dateutil.relativedelta import relativedelta
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from database.models import Subscription
+from database.models import Payment, Subscription
+from utils.formatting import (
+    RU_MONTHS_GEN,
+    RU_MONTHS_NOM,
+    fmt_money,
+    fmt_price,
+    fmt_subscription_price,
+)
 
 router = Router()
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Locale helpers
-# ──────────────────────────────────────────────────────────────────────────────
-
-RU_MONTHS_NOM = [
-    "", "Январь", "Февраль", "Март", "Апрель", "Май", "Июнь",
-    "Июль", "Август", "Сентябрь", "Октябрь", "Ноябрь", "Декабрь",
-]
-
-RU_MONTHS_GEN = [
-    "", "января", "февраля", "марта", "апреля", "мая", "июня",
-    "июля", "августа", "сентября", "октября", "ноября", "декабря",
-]
-
-RU_DAYS = ["Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Вс"]
-
-
-def fmt_price(price: Decimal) -> str:
-    integer_part = int(price)
-    frac = int(round((price - integer_part) * 100))
-    s = f"{integer_part:,}".replace(",", "\u00a0")
-    return f"{s}.{frac:02d}"
+HISTORY_LIMIT = 30
 
 
 def monthly_cost(sub: Subscription) -> Decimal:
@@ -65,7 +53,9 @@ def reports_menu_keyboard() -> InlineKeyboardMarkup:
         inline_keyboard=[
             [InlineKeyboardButton(text="📅 Этот месяц", callback_data="report_this_month")],
             [InlineKeyboardButton(text="📆 Следующий месяц", callback_data="report_next_month")],
+            [InlineKeyboardButton(text="📆 Год", callback_data="report_year")],
             [InlineKeyboardButton(text="💰 Ежемесячные расходы", callback_data="report_monthly_total")],
+            [InlineKeyboardButton(text="🧾 История платежей", callback_data="report_history")],
             [InlineKeyboardButton(text="⬅️ Назад", callback_data="back_to_main")],
         ]
     )
@@ -79,59 +69,56 @@ def back_to_reports_keyboard() -> InlineKeyboardMarkup:
     )
 
 
+def history_keyboard(payments: list[Payment]) -> InlineKeyboardMarkup:
+    buttons: list[list[InlineKeyboardButton]] = []
+    for p in payments:
+        label = f"{p.paid_on.strftime('%d.%m.%y')} · {p.name} · {fmt_money(p.amount, p.currency, p.amount_original)}"
+        if len(label) > 60:
+            label = label[:59] + "…"
+        buttons.append([InlineKeyboardButton(text=label, callback_data=f"pay_view:{p.id}")])
+    buttons.append([InlineKeyboardButton(text="⬅️ К отчётам", callback_data="reports")])
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
+
+
+def payment_detail_keyboard(payment_id: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="🗑 Удалить из истории", callback_data=f"pay_del:{payment_id}")],
+            [InlineKeyboardButton(text="⬅️ К истории", callback_data="report_history")],
+        ]
+    )
+
+
 # ──────────────────────────────────────────────────────────────────────────────
 # Data helpers
 # ──────────────────────────────────────────────────────────────────────────────
 
 async def _get_user_subs(session: AsyncSession, user_id: int) -> list[Subscription]:
+    # Reports cover money actually due, so paused (is_active=False) subscriptions
+    # are excluded — they show up separately in the subscriptions list, not here.
     result = await session.execute(
         select(Subscription)
-        .where(Subscription.user_id == user_id)
+        .where(Subscription.user_id == user_id, Subscription.is_active.is_(True))
         .order_by(Subscription.next_payment)
     )
     return list(result.scalars().all())
 
 
-def _subs_in_month(subs: list[Subscription], year: int, month: int) -> tuple[list[Subscription], list[Subscription]]:
-    """Split subscriptions into (upcoming, already_passed) for the given year/month."""
-    today = date.today()
-    first_day = date(year, month, 1)
-    last_day = date(year, month, calendar.monthrange(year, month)[1])
-
-    upcoming: list[Subscription] = []
-    passed: list[Subscription] = []
-
-    for sub in subs:
-        # Check if next_payment falls in [first_day, last_day]
-        np = sub.next_payment
-        if first_day <= np <= last_day:
-            if np < today or (year < today.year) or (year == today.year and month < today.month):
-                passed.append(sub)
-            else:
-                upcoming.append(sub)
-        # For past months — all subs that *would have* been due
-        # For future months — estimate based on period
-        elif year > today.year or (year == today.year and month > today.month):
-            # Future month — use period to estimate
-            sub_np = sub.next_payment
-            while sub_np < first_day:
-                if sub.period == "monthly":
-                    from dateutil.relativedelta import relativedelta as rd
-                    sub_np = sub_np + rd(months=1)
-                else:
-                    from dateutil.relativedelta import relativedelta as rd
-                    sub_np = sub_np + rd(years=1)
-            if first_day <= sub_np <= last_day:
-                upcoming.append(sub)
-
-    return upcoming, passed
+async def _get_user_payments(
+    session: AsyncSession, user_id: int, limit: int | None = None
+) -> list[Payment]:
+    stmt = (
+        select(Payment)
+        .where(Payment.user_id == user_id)
+        .order_by(Payment.paid_on.desc(), Payment.id.desc())
+    )
+    if limit is not None:
+        stmt = stmt.limit(limit)
+    result = await session.execute(stmt)
+    return list(result.scalars().all())
 
 
-def _build_month_report(
-    subs: list[Subscription],
-    year: int,
-    month: int,
-) -> str:
+def _build_month_report(subs: list[Subscription], year: int, month: int) -> str:
     today = date.today()
     is_current = (year == today.year and month == today.month)
     is_future = year > today.year or (year == today.year and month > today.month)
@@ -144,22 +131,18 @@ def _build_month_report(
     total = Decimal("0")
 
     for sub in subs:
-        # Find the payment date for this month
         payment_date: date | None = None
         candidate = sub.next_payment
 
         if is_future:
-            # Advance candidate to target month
-            from dateutil.relativedelta import relativedelta as rd
             while candidate < first_day:
                 if sub.period == "monthly":
-                    candidate += rd(months=1)
+                    candidate += relativedelta(months=1)
                 else:
-                    candidate += rd(years=1)
+                    candidate += relativedelta(years=1)
             if first_day <= candidate <= last_day:
                 payment_date = candidate
         else:
-            # Current or past month: use stored next_payment if in range, else skip
             if first_day <= candidate <= last_day:
                 payment_date = candidate
 
@@ -182,13 +165,13 @@ def _build_month_report(
     if upcoming:
         lines.append("Предстоящие списания:")
         for d, sub in upcoming:
-            lines.append(f"🔹 {d.day} {RU_MONTHS_GEN[d.month]} — {sub.name} — {fmt_price(sub.price)} ₽")
+            lines.append(f"🔹 {d.day} {RU_MONTHS_GEN[d.month]} — {sub.name} — {fmt_subscription_price(sub)}")
         lines.append("")
 
     if passed:
         lines.append("Уже прошли:")
         for d, sub in passed:
-            lines.append(f"✅ {d.day} {RU_MONTHS_GEN[d.month]} — {sub.name} — {fmt_price(sub.price)} ₽")
+            lines.append(f"✅ {d.day} {RU_MONTHS_GEN[d.month]} — {sub.name} — {fmt_subscription_price(sub)}")
         lines.append("")
 
     if not upcoming and not passed:
@@ -203,25 +186,52 @@ def _build_month_report(
 
 def _build_monthly_total(subs: list[Subscription]) -> str:
     if not subs:
-        return "У тебя пока нет подписок."
+        return "У тебя пока нет активных подписок."
 
-    total_monthly = sum(monthly_cost(s) for s in subs)
+    total_monthly = sum((monthly_cost(s) for s in subs), Decimal("0"))
     total_yearly = total_monthly * 12
 
-    lines = [
-        "💰 <b>Ежемесячные расходы</b>\n",
-    ]
+    lines = ["💰 <b>Ежемесячные расходы</b>\n"]
     for sub in sorted(subs, key=lambda s: monthly_cost(s), reverse=True):
         mc = monthly_cost(sub)
         period_sym = "мес" if sub.period == "monthly" else "год"
         lines.append(
-            f"🔹 {sub.name} — {fmt_price(sub.price)} ₽/{period_sym}"
+            f"🔹 {sub.name} — {fmt_subscription_price(sub)}/{period_sym}"
             + (f" (~{fmt_price(mc.quantize(Decimal('0.01')))} ₽/мес)" if sub.period == "yearly" else "")
         )
 
     lines.append("\n━━━━━━━━━━━━━━━")
     lines.append(f"📊 В месяц: ~{fmt_price(total_monthly.quantize(Decimal('0.01')))} ₽")
     lines.append(f"📆 В год: ~{fmt_price(total_yearly.quantize(Decimal('0.01')))} ₽")
+    return "\n".join(lines)
+
+
+def _build_year_report(subs: list[Subscription], payments: list[Payment], year: int) -> str:
+    by_month: dict[int, Decimal] = {}
+    actual_total = Decimal("0")
+    for p in payments:
+        if p.paid_on.year != year:
+            continue
+        by_month[p.paid_on.month] = by_month.get(p.paid_on.month, Decimal("0")) + p.amount
+        actual_total += p.amount
+
+    projected_annual = sum((monthly_cost(s) for s in subs), Decimal("0")) * 12
+
+    lines = [f"📆 <b>Расходы за {year}</b>\n"]
+    lines.append(f"✅ Фактически потрачено: ~{fmt_price(actual_total.quantize(Decimal('0.01')))} ₽")
+
+    if by_month:
+        lines.append("\nПо месяцам:")
+        for m in range(1, 13):
+            if m in by_month:
+                lines.append(f"🔹 {RU_MONTHS_NOM[m]} — ~{fmt_price(by_month[m].quantize(Decimal('0.01')))} ₽")
+    else:
+        lines.append("История платежей пока пуста — она наполняется по мере списаний.")
+
+    lines.append("\n━━━━━━━━━━━━━━━")
+    lines.append(
+        f"📈 Прогноз на год по активным подпискам: ~{fmt_price(projected_annual.quantize(Decimal('0.01')))} ₽"
+    )
     return "\n".join(lines)
 
 
@@ -244,11 +254,7 @@ async def report_this_month(callback: CallbackQuery, session: AsyncSession) -> N
     today = date.today()
     subs = await _get_user_subs(session, callback.from_user.id)
     text = _build_month_report(subs, today.year, today.month)
-    await callback.message.edit_text(
-        text,
-        reply_markup=back_to_reports_keyboard(),
-        parse_mode="HTML",
-    )
+    await callback.message.edit_text(text, reply_markup=back_to_reports_keyboard(), parse_mode="HTML")
     await callback.answer()
 
 
@@ -262,11 +268,17 @@ async def report_next_month(callback: CallbackQuery, session: AsyncSession) -> N
 
     subs = await _get_user_subs(session, callback.from_user.id)
     text = _build_month_report(subs, year, month)
-    await callback.message.edit_text(
-        text,
-        reply_markup=back_to_reports_keyboard(),
-        parse_mode="HTML",
-    )
+    await callback.message.edit_text(text, reply_markup=back_to_reports_keyboard(), parse_mode="HTML")
+    await callback.answer()
+
+
+@router.callback_query(F.data == "report_year")
+async def report_year(callback: CallbackQuery, session: AsyncSession) -> None:
+    today = date.today()
+    subs = await _get_user_subs(session, callback.from_user.id)
+    payments = await _get_user_payments(session, callback.from_user.id)
+    text = _build_year_report(subs, payments, today.year)
+    await callback.message.edit_text(text, reply_markup=back_to_reports_keyboard(), parse_mode="HTML")
     await callback.answer()
 
 
@@ -274,9 +286,80 @@ async def report_next_month(callback: CallbackQuery, session: AsyncSession) -> N
 async def report_monthly_total(callback: CallbackQuery, session: AsyncSession) -> None:
     subs = await _get_user_subs(session, callback.from_user.id)
     text = _build_monthly_total(subs)
-    await callback.message.edit_text(
-        text,
-        reply_markup=back_to_reports_keyboard(),
-        parse_mode="HTML",
-    )
+    await callback.message.edit_text(text, reply_markup=back_to_reports_keyboard(), parse_mode="HTML")
     await callback.answer()
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Payment history
+# ──────────────────────────────────────────────────────────────────────────────
+
+@router.callback_query(F.data == "report_history")
+async def report_history(callback: CallbackQuery, session: AsyncSession) -> None:
+    payments = await _get_user_payments(session, callback.from_user.id, limit=HISTORY_LIMIT)
+    if not payments:
+        await callback.message.edit_text(
+            "🧾 <b>История платежей</b>\n\n"
+            "Пока пусто. История наполняется автоматически по мере списаний по подпискам.",
+            reply_markup=back_to_reports_keyboard(),
+            parse_mode="HTML",
+        )
+        await callback.answer()
+        return
+
+    total = sum((p.amount for p in payments), Decimal("0"))
+    text = (
+        "🧾 <b>История платежей</b>\n\n"
+        f"Последние {len(payments)} записей (на ~{fmt_price(total.quantize(Decimal('0.01')))} ₽).\n"
+        "Нажми на запись, чтобы посмотреть или удалить."
+    )
+    await callback.message.edit_text(text, reply_markup=history_keyboard(payments), parse_mode="HTML")
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("pay_view:"))
+async def payment_view(callback: CallbackQuery, session: AsyncSession) -> None:
+    payment_id = int(callback.data.split(":")[1])
+    payment = await session.get(Payment, payment_id)
+    if not payment or payment.user_id != callback.from_user.id:
+        await callback.answer("Платёж не найден.", show_alert=True)
+        return
+
+    text = (
+        "🧾 <b>Платёж</b>\n\n"
+        f"📝 {payment.name}\n"
+        f"💰 {fmt_money(payment.amount, payment.currency, payment.amount_original)}\n"
+        f"📅 {payment.paid_on.strftime('%d.%m.%Y')}"
+    )
+    await callback.message.edit_text(text, reply_markup=payment_detail_keyboard(payment_id), parse_mode="HTML")
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("pay_del:"))
+async def payment_delete(callback: CallbackQuery, session: AsyncSession) -> None:
+    payment_id = int(callback.data.split(":")[1])
+    payment = await session.get(Payment, payment_id)
+    if not payment or payment.user_id != callback.from_user.id:
+        await callback.answer("Платёж не найден.", show_alert=True)
+        return
+
+    await session.delete(payment)
+    await session.commit()
+    await callback.answer("Запись удалена 🗑")
+
+    payments = await _get_user_payments(session, callback.from_user.id, limit=HISTORY_LIMIT)
+    if not payments:
+        await callback.message.edit_text(
+            "🧾 <b>История платежей</b>\n\nПусто.",
+            reply_markup=back_to_reports_keyboard(),
+            parse_mode="HTML",
+        )
+        return
+
+    total = sum((p.amount for p in payments), Decimal("0"))
+    text = (
+        "🧾 <b>История платежей</b>\n\n"
+        f"Последние {len(payments)} записей (на ~{fmt_price(total.quantize(Decimal('0.01')))} ₽).\n"
+        "Нажми на запись, чтобы посмотреть или удалить."
+    )
+    await callback.message.edit_text(text, reply_markup=history_keyboard(payments), parse_mode="HTML")

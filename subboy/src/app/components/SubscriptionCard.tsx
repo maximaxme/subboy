@@ -1,4 +1,4 @@
-import { CreditCard, ChevronRight } from 'lucide-react'
+import { CreditCard, ChevronRight, PauseCircle } from 'lucide-react'
 
 const SUBSCRIPTION_COLORS = ['#6366f1', '#8b5cf6', '#ec4899', '#f59e0b', '#10b981', '#06b6d4', '#ef4444'] as const
 
@@ -13,6 +13,7 @@ type Props = {
   nextBilling: string
   categoryName?: string
   colorIndex?: number
+  isActive?: boolean
   onClick: () => void
 }
 
@@ -23,6 +24,7 @@ export function SubscriptionCard({
   nextBilling,
   categoryName,
   colorIndex = 0,
+  isActive = true,
   onClick,
 }: Props) {
   const color = getColor(colorIndex)
@@ -30,18 +32,31 @@ export function SubscriptionCard({
     <button
       type="button"
       onClick={onClick}
-      className="w-full text-left bg-secondary/40 hover:bg-secondary/60 border border-border rounded-lg p-4 transition-colors group"
+      className={`w-full text-left border border-border rounded-lg p-4 transition-colors group ${
+        isActive ? 'bg-secondary/40 hover:bg-secondary/60' : 'bg-secondary/20 hover:bg-secondary/30 opacity-60'
+      }`}
     >
       <div className="flex items-start justify-between mb-3">
         <div className="flex items-center gap-3">
           <div
             className="w-10 h-10 rounded-lg flex items-center justify-center shrink-0"
-            style={{ backgroundColor: color + '20', color }}
+            style={{ backgroundColor: color + '20', color: isActive ? color : undefined }}
           >
-            <CreditCard className="w-5 h-5" />
+            {isActive ? (
+              <CreditCard className="w-5 h-5" />
+            ) : (
+              <PauseCircle className="w-5 h-5 text-muted-foreground" />
+            )}
           </div>
           <div>
-            <p className="text-foreground font-medium">{name}</p>
+            <div className="flex items-center gap-2">
+              <p className="text-foreground font-medium">{name}</p>
+              {!isActive && (
+                <span className="text-[10px] font-medium px-1.5 py-0.5 rounded bg-secondary text-muted-foreground uppercase tracking-wide">
+                  пауза
+                </span>
+              )}
+            </div>
             {categoryName && (
               <p className="text-xs text-muted-foreground mt-0.5">{categoryName}</p>
             )}

@@ -4,6 +4,7 @@ from aiogram.fsm.state import State, StatesGroup
 class AddSubscription(StatesGroup):
     """States for adding a new subscription step by step."""
     name = State()
+    currency = State()
     price = State()
     period = State()
     category = State()
@@ -14,6 +15,7 @@ class EditSubscription(StatesGroup):
     """States for editing an existing subscription field by field."""
     # Which subscription is being edited is stored in FSM data as 'sub_id'
     name = State()
+    currency = State()
     price = State()
     period = State()
     next_payment = State()
