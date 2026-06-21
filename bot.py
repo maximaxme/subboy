@@ -58,9 +58,23 @@ async def main() -> None:
     scheduler.start()
     logger.info("Scheduler started. Telegram proxy: %s", SOCKS5_PROXY or "disabled")
 
+    logger.info("Starting bot...")
     try:
-        logger.info("Starting bot...")
-        await dp.start_polling(bot)
+        # Resilient polling: the Telegram connection goes through the WARP proxy,
+        # whose route can briefly drop (ProxyError: Host unreachable). Instead of
+        # crashing the whole process, wait and retry so the bot self-heals when the
+        # route returns. SIGTERM makes start_polling return normally → clean exit.
+        while True:
+            try:
+                await dp.start_polling(bot)
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                logger.warning("Polling stopped with %r; retrying in 10s...", e)
+                await asyncio.sleep(10)
+                continue
+            else:
+                break
     finally:
         scheduler.shutdown(wait=False)
         await bot.session.close()

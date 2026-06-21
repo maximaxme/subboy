@@ -51,3 +51,10 @@ def fmt_subscription_price(sub: Subscription) -> str:
         getattr(sub, "price_currency", "RUB"),
         getattr(sub, "price_original", None),
     )
+
+
+def monthly_cost(sub: Subscription) -> Decimal:
+    """Normalised monthly cost (yearly subscriptions divided by 12)."""
+    if sub.period == "monthly":
+        return sub.price
+    return sub.price / 12

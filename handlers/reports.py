@@ -31,17 +31,12 @@ from utils.formatting import (
     fmt_money,
     fmt_price,
     fmt_subscription_price,
+    monthly_cost,
 )
 
 router = Router()
 
 HISTORY_LIMIT = 30
-
-
-def monthly_cost(sub: Subscription) -> Decimal:
-    if sub.period == "monthly":
-        return sub.price
-    return sub.price / 12
 
 
 # ──────────────────────────────────────────────────────────────────────────────
